@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use gardr::{Store, validate_workspace};
@@ -12,10 +13,11 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    let root = option(&mut args, "--root")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("GARDR_ROOT").map(PathBuf::from))
-        .ok_or_else(|| "--root or GARDR_ROOT is required".to_owned())?;
+    let root = root(
+        option(&mut args, "--root").map(PathBuf::from),
+        env::var_os("GARDR_ROOT").map(PathBuf::from),
+        env::var_os("HOME"),
+    )?;
     let store = Store::open(root);
     match take(&mut args)?.as_str() {
         "spec" => spec(&store, args),
@@ -127,5 +129,46 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     Ok(())
 }
 fn usage() -> String {
-    "usage: gardr --root <path> <spec|run> ...".to_owned()
+    "usage: gardr [--root <path>] <spec|run> ...".to_owned()
+}
+
+fn root(
+    command_line_root: Option<PathBuf>,
+    environment_root: Option<PathBuf>,
+    home: Option<OsString>,
+) -> Result<PathBuf, String> {
+    command_line_root
+        .or(environment_root)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".gardr")))
+        .ok_or_else(|| "unable to resolve the default root: HOME is not set".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_prefers_command_line_then_environment_then_home_default() {
+        let home = OsString::from("/home/tester");
+        assert_eq!(
+            root(
+                Some(PathBuf::from("/command")),
+                Some(PathBuf::from("/environment")),
+                Some(home.clone())
+            ),
+            Ok(PathBuf::from("/command"))
+        );
+        assert_eq!(
+            root(
+                None,
+                Some(PathBuf::from("/environment")),
+                Some(home.clone())
+            ),
+            Ok(PathBuf::from("/environment"))
+        );
+        assert_eq!(
+            root(None, None, Some(home)),
+            Ok(PathBuf::from("/home/tester/.gardr"))
+        );
+    }
 }

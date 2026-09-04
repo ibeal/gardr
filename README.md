@@ -4,8 +4,9 @@ Gardr runs a prepared, sealed Heimr workspace under one named sandbox specificat
 the spec store, container lifecycle, and durable execution records. It does not construct a
 workspace, provide agent context, read `HANDOFF.json`, or decide whether an agent succeeded.
 
-`gardr` requires `GARDR_ROOT` (or `--root`). Its store contains `specs/`, `runs/`, optional
-approved mount directories under `mounts/`, and optional Docker build contexts under `images/`.
+`gardr` stores its data in `~/.gardr` by default. Set `GARDR_ROOT` or pass `--root` to override
+that location; `--root` takes precedence. Its store contains `specs/`, `runs/`, optional approved
+mount directories under `mounts/`, and optional Docker build contexts under `images/`.
 Those named directories are the only host paths a spec can request besides the supplied workspace.
 
 ```toml
@@ -14,7 +15,7 @@ version = 1
 
 [image]
 reference = "ghcr.io/example/agent:latest"
-# build_context = "agent-image" # resolves only to $GARDR_ROOT/images/agent-image
+# build_context = "agent-image" # resolves only to the configured root's images/agent-image
 
 [sandbox]
 network = "none" # "bridge" is the only other initial policy
@@ -24,7 +25,7 @@ adapter = "claude-code"
 command = ["claude", "-p", "complete the assigned work"]
 
 [[mounts]]
-name = "tools"                  # resolves only to $GARDR_ROOT/mounts/tools
+name = "tools"                  # resolves only to the configured root's mounts/tools
 target = "/tools"
 read_only = true
 
@@ -33,19 +34,19 @@ environment = ["GH_TOKEN"]     # references only; values are never stored
 ```
 
 ```sh
-gardr --root /var/lib/gardr spec add build --file build.toml
-gardr --root /var/lib/gardr spec validate build
-gardr --root /var/lib/gardr spec list
-gardr --root /var/lib/gardr run start --workspace /workspaces/task --spec build
-gardr --root /var/lib/gardr run observe run-…
-gardr --root /var/lib/gardr run stop run-…
-gardr --root /var/lib/gardr run cleanup run-…
+gardr spec add build --file build.toml
+gardr spec validate build
+gardr spec list
+gardr run start --workspace /workspaces/task --spec build
+gardr run observe run-…
+gardr run stop run-…
+gardr run cleanup run-…
 ```
 
 All command results except `spec show` are single JSON documents for orchestration. `run observe`
 does not inspect a workspace, stream logs, attach a terminal, or interpret handoff content. Each
 run writes immutable `spec.toml` and `resolved.json`, then mutable `state.json` and `runner.log`
-under `$GARDR_ROOT/runs/<run-id>/`. Resume validates the sealed workspace and uses the frozen spec;
+under the configured root's `runs/<run-id>/`. Resume validates the sealed workspace and uses the frozen spec;
 it never silently replaces state. Cleanup is idempotent and refuses a running run.
 
 The initial backend is Docker. Gardr runs the workspace at `/workspace`, selected approved mounts
