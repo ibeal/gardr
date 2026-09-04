@@ -13,15 +13,39 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    let root = root(
-        option(&mut args, "--root").map(PathBuf::from),
-        env::var_os("GARDR_ROOT").map(PathBuf::from),
-        env::var_os("HOME"),
-    )?;
-    let store = Store::open(root);
+    let command_line_root = option(&mut args, "--root").map(PathBuf::from);
     match take(&mut args)?.as_str() {
-        "spec" => spec(&store, args),
-        "run" => run_command(&store, args),
+        "help" | "--help" => {
+            reject_extra(&args)?;
+            print!("{HELP}");
+            Ok(())
+        }
+        "docs" => {
+            reject_extra(&args)?;
+            print!("{DOCS}");
+            Ok(())
+        }
+        "spec" if subcommand_help(&args) => {
+            print!("{SPEC_HELP}");
+            Ok(())
+        }
+        "run" if subcommand_help(&args) => {
+            print!("{RUN_HELP}");
+            Ok(())
+        }
+        command @ ("spec" | "run") => {
+            let root = root(
+                command_line_root,
+                env::var_os("GARDR_ROOT").map(PathBuf::from),
+                env::var_os("HOME"),
+            )?;
+            let store = Store::open(root);
+            match command {
+                "spec" => spec(&store, args),
+                "run" => run_command(&store, args),
+                _ => unreachable!(),
+            }
+        }
         _ => Err(usage()),
     }
 }
@@ -121,6 +145,9 @@ fn reject_extra(args: &[String]) -> Result<(), String> {
         Err(format!("unexpected arguments: {}", args.join(" ")))
     }
 }
+fn subcommand_help(args: &[String]) -> bool {
+    args.is_empty() || matches!(args, [argument] if argument == "help" || argument == "--help")
+}
 fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     println!(
         "{}",
@@ -129,8 +156,85 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     Ok(())
 }
 fn usage() -> String {
-    "usage: gardr [--root <path>] <spec|run> ...".to_owned()
+    HELP.trim_end().to_owned()
 }
+
+const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  spec  Manage sandbox specifications\n  run   Manage workspace runs\n  docs  Print built-in guidance and examples\n  help  Print this message\n\nSpec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nRun `gardr spec --help` or `gardr run --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
+
+const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nUse `gardr docs` for the specification format.\n";
+
+const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name>\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
+
+const DOCS: &str = r#"# gardr — durable sandbox execution
+
+Gardr runs a prepared, sealed workspace under one named sandbox specification. It owns the
+specification store, Docker container lifecycle, and durable run records. It does not create a
+workspace, prepare an agent dispatch, or determine whether the agent completed its assignment.
+
+## Root and store
+
+Gardr uses `~/.gardr` by default. Set `GARDR_ROOT` or pass `--root <path>` to select another root;
+`--root` wins. The root contains `specs/`, `runs/`, and optional approved `mounts/` and `images/`
+directories. Gardr creates `specs/` and `runs/` when they are first needed.
+
+## Commands
+
+```text
+gardr spec add <name> --file <path>      # validate and store an immutable spec
+gardr spec list                          # JSON list of stored names
+gardr spec show <name>                   # print the TOML and its SHA-256 to stderr
+gardr spec validate <name>               # JSON identity for one stored spec
+
+gardr run validate-workspace <path>      # validate a prepared, sealed workspace
+gardr run start --workspace <path> --spec <name>
+gardr run observe <run-id>               # reconcile and return current run state
+gardr run resume <run-id>                # restart a stopped or failed run
+gardr run stop <run-id>                  # stop a running container
+gardr run cleanup <run-id>               # remove a non-running container; idempotent
+```
+
+All command results except `spec show` are one JSON document, intended for an orchestrator to read.
+
+## A sandbox specification
+
+```toml
+version = 1
+
+[image]
+reference = "ghcr.io/example/agent:latest"
+# build_context = "agent-image" # optional: <root>/images/agent-image/Dockerfile
+
+[sandbox]
+network = "none" # or "bridge"
+
+[harness]
+adapter = "claude-code"
+command = ["claude", "-p", "complete the assigned work"]
+
+[[mounts]]
+name = "tools"                  # resolves only to <root>/mounts/tools
+target = "/tools"
+read_only = true
+
+[credentials]
+environment = ["GH_TOKEN"]     # names only; values are never stored
+```
+
+Spec names, mount names, and build-context names select direct children of the approved root
+directories. A mount cannot target `/workspace`, and Gardr rejects unknown fields, duplicate mount
+names or targets, invalid container paths, and credential values.
+
+## Workspace and lifecycle
+
+`run start` accepts only a prepared workspace containing one or more sealed entries under
+`dispatches/`. Gardr mounts that workspace at `/workspace`, freezes the selected spec, records the
+workspace seal and approved mounts, then starts Docker. It never falls back to host execution.
+
+Each run has a directory at `<root>/runs/<run-id>/` containing the frozen `spec.toml`, resolved
+configuration, run state, mount lock, runner log, and artifacts directory. `resume` revalidates the
+workspace seal, frozen spec, and approved mounts before launching again. `cleanup` is terminal and
+refuses a running run; stop it first.
+"#;
 
 fn root(
     command_line_root: Option<PathBuf>,
@@ -170,5 +274,20 @@ mod tests {
             root(None, None, Some(home)),
             Ok(PathBuf::from("/home/tester/.gardr"))
         );
+    }
+
+    #[test]
+    fn help_documents_the_default_root_and_docs_command() {
+        assert!(HELP.contains("~/.gardr by default"));
+        assert!(HELP.contains("docs  Print built-in guidance"));
+    }
+
+    #[test]
+    fn nested_help_is_available_without_a_store() {
+        assert!(subcommand_help(&[]));
+        assert!(subcommand_help(&["--help".to_owned()]));
+        assert!(!subcommand_help(&["list".to_owned()]));
+        assert!(SPEC_HELP.contains("add"));
+        assert!(RUN_HELP.contains("validate-workspace"));
     }
 }
