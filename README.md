@@ -18,7 +18,7 @@ reference = "ghcr.io/example/agent:latest"
 # build_context = "agent-image" # resolves only to the configured root's images/agent-image
 
 [sandbox]
-network = "none" # "bridge" is the only other initial policy
+network = "none" # use "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
 adapter = "claude-code"
@@ -31,6 +31,18 @@ read_only = true
 
 [credentials]
 environment = ["GH_TOKEN"]     # references only; values are never stored
+
+# Bridge runs start with Gardr's minimum egress policy plus these domains.
+[firewall]
+allow = ["packages.example.com"]
+
+# Each tool is checked first. Missing tools run their declared commands while
+# the listed domains are temporarily added, then Gardr reapplies runtime egress.
+[[tools.install]]
+name = "go"
+check = "go"
+install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "latest"], ["asdf", "set", "-u", "golang", "latest"]]
+allow = ["go.dev", "storage.googleapis.com"]
 ```
 
 ```sh
@@ -66,3 +78,11 @@ read-only and reconciles the container's current status and known exit code for 
 `run stop`, `run resume`, and `run cleanup` persist their lifecycle transitions; cleanup removes a
 non-running container and is idempotent. An unavailable container or incomplete resolved state is
 reported as an explicit runner failure rather than treated as agent-workflow success.
+
+For `network = "bridge"`, Gardr follows the containerized-agent firewall model: it resolves each
+allowed domain at startup, adds the resolved IPs to an ipset, pins the selected address in
+`/etc/hosts`, and drops other egress. The specification is trusted and named, so there is no
+separate firewall maximum. Gardr records both normal runtime egress and the temporary installer
+egress in `resolved.json`. The selected image must provide the same Debian-style runtime contract as
+the Gardr agent image: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that starts its harness
+only after `/usr/local/bin/init-firewall.sh` succeeds.

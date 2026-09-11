@@ -295,13 +295,14 @@ impl Store {
                         serde_json::to_vec_pretty(&ResolvedConfig::from_spec(&record, &spec, self))
                             .map_err(|error| error.to_string())?;
                     write_new(&directory.join("resolved.json"), &resolved)?;
+                    write_bootstrap(&directory, &spec)?;
                     save_record(&directory, &record)?;
                     image
                 }
                 Err(error) => return fail_run(&directory, &mut record, error),
             },
         };
-        let arguments = match docker_arguments(self, &spec, &workspace, &image) {
+        let arguments = match docker_arguments(self, &spec, &workspace, &directory, &image) {
             Ok(arguments) => arguments,
             Err(error) => return fail_run(&directory, &mut record, error),
         };
@@ -353,6 +354,10 @@ pub struct Spec {
     pub mounts: Vec<Mount>,
     #[serde(default)]
     pub credentials: Credentials,
+    #[serde(default)]
+    pub firewall: Firewall,
+    #[serde(default)]
+    pub tools: Tooling,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -397,6 +402,27 @@ pub struct Mount {
 pub struct Credentials {
     #[serde(default)]
     pub environment: Vec<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Firewall {
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tooling {
+    #[serde(default)]
+    pub install: Vec<Tool>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tool {
+    pub name: String,
+    pub check: String,
+    pub install: Vec<Vec<String>>,
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -450,6 +476,13 @@ struct ResolvedConfig<'a> {
     harness: &'a Harness,
     mounts: Vec<ResolvedMount>,
     credentials: &'a Credentials,
+    firewall: ResolvedFirewall,
+    tools: &'a Tooling,
+}
+#[derive(Serialize)]
+struct ResolvedFirewall {
+    runtime: Vec<String>,
+    effective: Vec<String>,
 }
 #[derive(Serialize)]
 struct ResolvedMount {
@@ -485,6 +518,11 @@ impl<'a> ResolvedConfig<'a> {
                 })
                 .collect(),
             credentials: &spec.credentials,
+            firewall: ResolvedFirewall {
+                runtime: runtime_domains(spec),
+                effective: installer_domains(spec),
+            },
+            tools: &spec.tools,
         }
     }
 }
@@ -536,6 +574,33 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
     }
     for reference in &spec.credentials.environment {
         validate_environment_reference(reference)?;
+    }
+    let mut domains = BTreeSet::new();
+    for domain in spec
+        .firewall
+        .allow
+        .iter()
+        .chain(spec.tools.install.iter().flat_map(|tool| tool.allow.iter()))
+    {
+        validate_domain(domain)?;
+        domains.insert(domain);
+    }
+    let mut tool_names = BTreeSet::new();
+    for tool in &spec.tools.install {
+        validate_name("tool name", &tool.name)?;
+        if !tool_names.insert(&tool.name) {
+            return Err(format!("duplicate tool name: {}", tool.name));
+        }
+        validate_command("tool check", std::slice::from_ref(&tool.check))?;
+        if tool.install.is_empty() {
+            return Err(format!("tool install commands are required: {}", tool.name));
+        }
+        for command in &tool.install {
+            validate_command("tool install command", command)?;
+        }
+    }
+    if !spec.tools.install.is_empty() && matches!(spec.sandbox.network, Network::None) {
+        return Err("tools require sandbox.network = 'bridge'".to_owned());
     }
     Ok(())
 }
@@ -749,9 +814,11 @@ fn docker_arguments(
     store: &Store,
     spec: &Spec,
     workspace: &Path,
+    run_directory: &Path,
     image: &str,
 ) -> Result<Vec<String>> {
     validate_docker_path("workspace path", workspace)?;
+    validate_docker_path("run directory", run_directory)?;
     let mut args = vec![
         "run".to_owned(),
         "--detach".to_owned(),
@@ -764,6 +831,26 @@ fn docker_arguments(
         "--mount".to_owned(),
         format!("type=bind,source={},target=/workspace", workspace.display()),
     ];
+    if matches!(spec.sandbox.network, Network::Bridge) {
+        args.extend([
+            "--cap-add".to_owned(),
+            "NET_ADMIN".to_owned(),
+            "--env".to_owned(),
+            "AP_AGENT_MODE=1".to_owned(),
+            "--env".to_owned(),
+            "RUN_MANIFEST=/gardr/resolved.json".to_owned(),
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target=/gardr,readonly",
+                run_directory.display()
+            ),
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target=/usr/local/bin/init-firewall.sh,readonly",
+                run_directory.join("firewall-init.sh").display()
+            ),
+        ]);
+    }
     for mount in &spec.mounts {
         let source = approved_child(&store.mounts_path(), &mount.name)?;
         let readonly = if mount.read_only { ",readonly" } else { "" };
@@ -784,8 +871,95 @@ fn docker_arguments(
         args.extend(["--env".to_owned(), reference.clone()]);
     }
     args.push(image.to_owned());
+    if matches!(spec.sandbox.network, Network::Bridge) {
+        args.extend([
+            "sh".to_owned(),
+            "/gardr/tool-bootstrap.sh".to_owned(),
+            "gardr-bootstrap".to_owned(),
+        ]);
+    }
     args.extend(spec.harness.command.clone());
     Ok(args)
+}
+
+const FIREWALL_MINIMUM: &[&str] = &[
+    "api.anthropic.com",
+    "api.github.com",
+    "claude.ai",
+    "crates.io",
+    "github.com",
+    "index.crates.io",
+    "registry.npmjs.org",
+    "static.crates.io",
+    "static.rust-lang.org",
+];
+
+fn runtime_domains(spec: &Spec) -> Vec<String> {
+    FIREWALL_MINIMUM
+        .iter()
+        .map(|domain| (*domain).to_owned())
+        .chain(spec.firewall.allow.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn installer_domains(spec: &Spec) -> Vec<String> {
+    runtime_domains(spec)
+        .into_iter()
+        .chain(
+            spec.tools
+                .install
+                .iter()
+                .flat_map(|tool| tool.allow.iter().cloned()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn write_bootstrap(directory: &Path, spec: &Spec) -> Result<()> {
+    if matches!(spec.sandbox.network, Network::None) {
+        return Ok(());
+    }
+    let firewall = directory.join("firewall-init.sh");
+    write_new(&firewall, include_bytes!("../assets/firewall-init.sh"))?;
+    set_executable(&firewall)?;
+    write_new(
+        &directory.join("runtime-domains.txt"),
+        runtime_domains(spec).join("\n").as_bytes(),
+    )?;
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    for tool in &spec.tools.install {
+        script.push_str(&format!(
+            "if ! command -v {} >/dev/null 2>&1; then\n",
+            shell_quote(&tool.check)
+        ));
+        for command in &tool.install {
+            script.push_str(
+                &command
+                    .iter()
+                    .map(|word| shell_quote(word))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            script.push('\n');
+        }
+        script.push_str(&format!(
+            "command -v {} >/dev/null 2>&1\nfi\n",
+            shell_quote(&tool.check)
+        ));
+    }
+    script.push_str("sudo -n /usr/local/bin/init-firewall.sh '' /workspace /gardr/runtime-domains.txt\nshift\nexec \"$@\"\n");
+    let bootstrap = directory.join("tool-bootstrap.sh");
+    write_new(&bootstrap, script.as_bytes())?;
+    set_executable(&bootstrap)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(io_error)
 }
 
 fn save_record(directory: &Path, record: &RunRecord) -> Result<()> {
@@ -983,6 +1157,34 @@ fn validate_environment_reference(value: &str) -> Result<()> {
         Ok(())
     }
 }
+fn validate_domain(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 253
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        Err(format!("invalid firewall domain: {value}"))
+    } else {
+        Ok(())
+    }
+}
+fn validate_command(label: &str, command: &[String]) -> Result<()> {
+    if command.is_empty()
+        || command.iter().any(|word| {
+            word.is_empty() || word.contains('\0') || word.contains('\n') || word.contains('\r')
+        })
+    {
+        Err(format!("invalid {label}"))
+    } else {
+        Ok(())
+    }
+}
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+}
 fn validate_container_path(label: &str, value: &str) -> Result<()> {
     if !value.starts_with('/')
         || value
@@ -1094,5 +1296,78 @@ mod tests {
                 .contains("not sealed")
         );
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn bridge_specs_resolve_tool_installer_egress_and_bootstrap() {
+        let spec = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(
+            runtime_domains(&spec),
+            vec![
+                "api.anthropic.com",
+                "api.github.com",
+                "claude.ai",
+                "crates.io",
+                "github.com",
+                "index.crates.io",
+                "registry.npmjs.org",
+                "runtime.example",
+                "static.crates.io",
+                "static.rust-lang.org",
+            ]
+        );
+        assert!(installer_domains(&spec).contains(&"install.example".to_owned()));
+
+        let temp = temporary_directory();
+        write_bootstrap(&temp, &spec).unwrap();
+        assert!(temp.join("firewall-init.sh").is_file());
+        assert!(temp.join("runtime-domains.txt").is_file());
+        assert!(
+            fs::read_to_string(temp.join("tool-bootstrap.sh"))
+                .unwrap()
+                .contains("asdf' 'install'")
+        );
+        let arguments = docker_arguments(
+            &Store::open(temp.join("store")),
+            &spec,
+            &temp,
+            &temp,
+            "image-id",
+        )
+        .unwrap();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--cap-add", "NET_ADMIN"])
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "RUN_MANIFEST=/gardr/resolved.json")
+        );
+        let firewall = fs::read_to_string(temp.join("firewall-init.sh")).unwrap();
+        assert!(firewall.contains("/etc/hosts"));
+        assert!(firewall.contains("iptables -P OUTPUT DROP"));
+        let bootstrap = fs::read_to_string(temp.join("tool-bootstrap.sh")).unwrap();
+        assert!(bootstrap.contains("runtime-domains.txt"));
+        assert!(bootstrap.contains("shift\nexec \"$@\""));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_firewall_and_offline_tool_specs() {
+        let malformed = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
+        assert!(
+            validate_spec(&malformed)
+                .unwrap_err()
+                .contains("invalid firewall domain")
+        );
+        let offline_tool = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
+        assert!(
+            validate_spec(&offline_tool)
+                .unwrap_err()
+                .contains("tools require")
+        );
     }
 }

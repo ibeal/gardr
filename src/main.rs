@@ -205,7 +205,7 @@ reference = "ghcr.io/example/agent:latest"
 # build_context = "agent-image" # optional: <root>/images/agent-image/Dockerfile
 
 [sandbox]
-network = "none" # or "bridge"
+network = "none" # or "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
 adapter = "claude-code"
@@ -218,11 +218,26 @@ read_only = true
 
 [credentials]
 environment = ["GH_TOKEN"]     # names only; values are never stored
+
+[firewall]
+allow = ["packages.example.com"]
+
+[[tools.install]]
+name = "go"
+check = "go"
+install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "latest"], ["asdf", "set", "-u", "golang", "latest"]]
+allow = ["go.dev", "storage.googleapis.com"]
 ```
 
 Spec names, mount names, and build-context names select direct children of the approved root
 directories. A mount cannot target `/workspace`, and Gardr rejects unknown fields, duplicate mount
 names or targets, invalid container paths, and credential values.
+
+Bridge runs get Gardr's minimum firewall allowlist plus `[firewall].allow`. Gardr resolves and pins
+each allowed address, allows tool-specific egress only while a missing tool is installed, then
+reapplies the runtime policy before starting the harness. The image must provide the Gardr agent
+runtime contract: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that fails closed when
+`/usr/local/bin/init-firewall.sh` fails.
 
 ## Workspace and lifecycle
 
