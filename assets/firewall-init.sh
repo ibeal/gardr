@@ -25,13 +25,10 @@ EOF
 
 while read -r domain; do
     [ -z "$domain" ] && continue
-    ips=$(dig +short A "$domain")
+    ips=$(dig +short A "$domain" | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)
     [ -n "$ips" ] || { echo "could not resolve $domain" >&2; exit 1; }
     pinned=''
     for ip in $ips; do
-        case "$ip" in
-            *[!0-9.]*|'') echo "invalid IPv4 address for $domain" >&2; exit 1 ;;
-        esac
         ipset add gardr-allowed "$ip" -exist
         [ -n "$pinned" ] || pinned=$ip
     done
