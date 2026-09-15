@@ -32,7 +32,7 @@ while read -r domain; do
         case "$ip" in
             *[!0-9.]*|'') echo "invalid IPv4 address for $domain" >&2; exit 1 ;;
         esac
-        ipset add gardr-allowed "$ip"
+        ipset add gardr-allowed "$ip" -exist
         [ -n "$pinned" ] || pinned=$ip
     done
     printf '%s\t%s\n' "$pinned" "$domain" >> /etc/hosts
