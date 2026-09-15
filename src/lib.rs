@@ -36,6 +36,10 @@ impl Store {
     pub fn images_path(&self) -> PathBuf {
         self.root.join("images")
     }
+    pub fn image_path(&self, name: &str) -> Result<PathBuf> {
+        validate_name("image profile name", name)?;
+        Ok(self.images_path().join(format!("{name}.toml")))
+    }
     pub fn pi_agent_path(&self) -> PathBuf {
         self.root.join("pi").join("agent")
     }
@@ -56,12 +60,77 @@ impl Store {
         let content = fs::read(source).map_err(io_error)?;
         let spec = parse_spec(&content)?;
         validate_spec(&spec)?;
+        self.validate_image_requirements(&spec)?;
         fs::create_dir_all(self.specs_path()).map_err(io_error)?;
         write_new(&destination, &content)?;
         Ok(SpecIdentity {
             name: name.to_owned(),
             sha256: digest(&content),
         })
+    }
+
+    pub fn add_image(&self, name: &str, source: &Path) -> Result<SpecIdentity> {
+        let destination = self.image_path(name)?;
+        if destination.exists() {
+            return Err(format!("image profile already exists: {name}"));
+        }
+        let content = fs::read(source).map_err(io_error)?;
+        let image = parse_image_profile(&content)?;
+        validate_image_profile(&image)?;
+        validate_image_profile_runtime(self, &image)?;
+        fs::create_dir_all(self.images_path()).map_err(io_error)?;
+        write_new(&destination, &content)?;
+        Ok(SpecIdentity {
+            name: name.to_owned(),
+            sha256: digest(&content),
+        })
+    }
+
+    pub fn read_image(&self, name: &str) -> Result<(ImageProfile, SpecIdentity, Vec<u8>)> {
+        let path = self.image_path(name)?;
+        let content = fs::read(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!("image profile does not exist: {name}")
+            } else {
+                io_error(error)
+            }
+        })?;
+        let image = parse_image_profile(&content)?;
+        validate_image_profile(&image)?;
+        Ok((
+            image,
+            SpecIdentity {
+                name: name.to_owned(),
+                sha256: digest(&content),
+            },
+            content,
+        ))
+    }
+
+    pub fn list_images(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        if !self.images_path().exists() {
+            return Ok(names);
+        }
+        for entry in fs::read_dir(self.images_path()).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let path = entry.path();
+            if entry.file_type().map_err(io_error)?.is_file()
+                && path.extension().is_some_and(|x| x == "toml")
+            {
+                names.push(path.file_stem().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn validate_image_requirements(&self, spec: &Spec) -> Result<SpecIdentity> {
+        validate_image_requirements(self, spec)
+    }
+
+    pub fn validate_runtime_spec(&self, spec: &Spec) -> Result<SpecIdentity> {
+        validate_runtime_spec(self, spec)
     }
 
     pub fn read_spec(&self, name: &str) -> Result<(Spec, SpecIdentity, Vec<u8>)> {
@@ -126,6 +195,7 @@ impl Store {
             spec: identity,
             workspace: workspace.display().to_string(),
             image: None,
+            image_profile: None,
             container: None,
             created_at: now(),
             updated_at: now(),
@@ -204,7 +274,10 @@ impl Store {
         validate_spec(&spec)?;
         validate_runtime_spec(self, &spec)?;
         verify_locked_mounts(self, &spec, &directory)?;
-        if !directory.join("resolved.json").is_file() || record.image.is_none() {
+        if !directory.join("resolved.json").is_file()
+            || record.image.is_none()
+            || record.image_profile.is_none()
+        {
             return Err(
                 "run has incomplete resolved configuration and cannot be resumed".to_owned(),
             );
@@ -306,8 +379,9 @@ impl Store {
         let image = match &record.image {
             Some(image) => image.clone(),
             None => match ensure_image(self, &spec) {
-                Ok(image) => {
+                Ok((image, profile)) => {
                     record.image = Some(image.clone());
+                    record.image_profile = Some(profile);
                     let resolved =
                         serde_json::to_vec_pretty(&ResolvedConfig::from_spec(&record, &spec, self))
                             .map_err(|error| error.to_string())?;
@@ -386,7 +460,23 @@ pub struct Spec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Image {
-    pub reference: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageProfile {
+    pub version: u32,
+    pub source: ImageSource,
+    #[serde(default)]
+    pub harnesses: Vec<Adapter>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageSource {
+    #[serde(default)]
+    pub reference: Option<String>,
     #[serde(default)]
     pub build_context: Option<String>,
 }
@@ -440,6 +530,8 @@ pub struct Firewall {
 #[serde(deny_unknown_fields)]
 pub struct Tooling {
     #[serde(default)]
+    pub required: Vec<String>,
+    #[serde(default)]
     pub install: Vec<Tool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -465,6 +557,8 @@ pub struct RunRecord {
     pub spec: SpecIdentity,
     pub workspace: String,
     pub image: Option<String>,
+    #[serde(default)]
+    pub image_profile: Option<SpecIdentity>,
     pub container: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -500,6 +594,7 @@ struct ResolvedConfig<'a> {
     workspace: String,
     spec: &'a SpecIdentity,
     image: &'a Image,
+    image_profile: &'a Option<SpecIdentity>,
     image_id: &'a Option<String>,
     sandbox: &'a Sandbox,
     harness: &'a Harness,
@@ -539,6 +634,7 @@ impl<'a> ResolvedConfig<'a> {
             workspace: record.workspace.clone(),
             spec: &record.spec,
             image: &spec.image,
+            image_profile: &record.image_profile,
             image_id: &record.image,
             sandbox: &spec.sandbox,
             harness: &spec.harness,
@@ -572,16 +668,44 @@ pub fn parse_spec(content: &[u8]) -> Result<Spec> {
     )
     .map_err(|error| format!("invalid run spec: {error}"))
 }
+pub fn parse_image_profile(content: &[u8]) -> Result<ImageProfile> {
+    toml::from_str(
+        std::str::from_utf8(content)
+            .map_err(|error| format!("image profile is not UTF-8: {error}"))?,
+    )
+    .map_err(|error| format!("invalid image profile: {error}"))
+}
+pub fn validate_image_profile(image: &ImageProfile) -> Result<()> {
+    if image.version != 1 {
+        return Err("image profile version must be 1".to_owned());
+    }
+    match (&image.source.reference, &image.source.build_context) {
+        (Some(reference), None) if !reference.trim().is_empty() => {}
+        (None, Some(context)) => validate_name("image build_context", context)?,
+        _ => {
+            return Err(
+                "image profile source requires exactly one of reference or build_context"
+                    .to_owned(),
+            );
+        }
+    }
+    let mut tools = BTreeSet::new();
+    for tool in &image.tools {
+        validate_name("image profile tool", tool)?;
+        if !tools.insert(tool) {
+            return Err(format!("duplicate image profile tool: {tool}"));
+        }
+    }
+    if image.harnesses.is_empty() {
+        return Err("image profile harnesses are required".to_owned());
+    }
+    Ok(())
+}
 pub fn validate_spec(spec: &Spec) -> Result<()> {
     if spec.version != 1 {
         return Err("run spec version must be 1".to_owned());
     }
-    if spec.image.reference.trim().is_empty() {
-        return Err("image.reference is required".to_owned());
-    }
-    if let Some(context) = &spec.image.build_context {
-        validate_name("image build_context", context)?;
-    }
+    validate_name("image name", &spec.image.name)?;
     if spec.harness.command.is_empty() {
         return Err("harness.command is required".to_owned());
     }
@@ -656,6 +780,13 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         validate_domain(domain)?;
         domains.insert(domain);
     }
+    let mut required_tools = BTreeSet::new();
+    for tool in &spec.tools.required {
+        validate_name("required tool", tool)?;
+        if !required_tools.insert(tool) {
+            return Err(format!("duplicate required tool: {tool}"));
+        }
+    }
     let mut tool_names = BTreeSet::new();
     for tool in &spec.tools.install {
         validate_name("tool name", &tool.name)?;
@@ -676,14 +807,8 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
     Ok(())
 }
 
-fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<()> {
-    if matches!(spec.harness.adapter, Adapter::Pi) {
-        validate_pi_agent(store)?;
-    }
-    for mount in &spec.mounts {
-        approved_child(&store.mounts_path(), &mount.name)?;
-    }
-    if let Some(context) = &spec.image.build_context
+fn validate_image_profile_runtime(store: &Store, image: &ImageProfile) -> Result<()> {
+    if let Some(context) = &image.source.build_context
         && !approved_child(&store.images_path(), context)?
             .join("Dockerfile")
             .is_file()
@@ -693,6 +818,39 @@ fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn validate_image_requirements(store: &Store, spec: &Spec) -> Result<SpecIdentity> {
+    let (image, identity, _) = store.read_image(&spec.image.name)?;
+    validate_image_profile_runtime(store, &image)?;
+    if !image.harnesses.iter().any(|adapter| {
+        std::mem::discriminant(adapter) == std::mem::discriminant(&spec.harness.adapter)
+    }) {
+        return Err(format!(
+            "image profile {} does not support the {} harness",
+            spec.image.name,
+            serde_json::to_string(&spec.harness.adapter)
+                .unwrap()
+                .trim_matches('"')
+        ));
+    }
+    for tool in &spec.tools.required {
+        if !image.tools.contains(tool) {
+            return Err(format!(
+                "image profile {} does not provide required tool: {tool}",
+                spec.image.name
+            ));
+        }
+    }
+    Ok(identity)
+}
+fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<SpecIdentity> {
+    if matches!(spec.harness.adapter, Adapter::Pi) {
+        validate_pi_agent(store)?;
+    }
+    for mount in &spec.mounts {
+        approved_child(&store.mounts_path(), &mount.name)?;
+    }
+    validate_image_requirements(store, spec)
 }
 fn lock_mounts(store: &Store, spec: &Spec) -> Result<Vec<MountLock>> {
     spec.mounts
@@ -846,8 +1004,10 @@ fn collect_inventory(
     Ok(())
 }
 
-fn ensure_image(store: &Store, spec: &Spec) -> Result<String> {
-    if let Some(context) = &spec.image.build_context {
+fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
+    let (profile, identity, _) = store.read_image(&spec.image.name)?;
+    validate_image_profile_runtime(store, &profile)?;
+    if let Some(context) = &profile.source.build_context {
         let context_path = approved_child(&store.images_path(), context)?;
         let tag = format!("gardr-{}", digest_directory(&context_path)?);
         let output = Command::new("docker")
@@ -865,22 +1025,27 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<String> {
                 return Err(command_error("docker build", &build));
             }
         }
-        image_id(&tag)
+        Ok((image_id(&tag)?, identity))
     } else {
+        let reference = profile
+            .source
+            .reference
+            .as_deref()
+            .expect("validated image profile reference");
         let inspect = Command::new("docker")
-            .args(["image", "inspect", &spec.image.reference])
+            .args(["image", "inspect", reference])
             .output()
             .map_err(io_error)?;
         if !inspect.status.success() {
             let pull = Command::new("docker")
-                .args(["pull", &spec.image.reference])
+                .args(["pull", reference])
                 .output()
                 .map_err(io_error)?;
             if !pull.status.success() {
                 return Err(command_error("docker pull", &pull));
             }
         }
-        image_id(&spec.image.reference)
+        Ok((image_id(reference)?, identity))
     }
 }
 
@@ -1464,7 +1629,7 @@ mod tests {
         path
     }
     fn spec() -> &'static [u8] {
-        b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n"
+        b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n"
     }
     #[test]
     fn specs_are_validated_and_immutable() {
@@ -1472,6 +1637,13 @@ mod tests {
         let source = temp.join("spec.toml");
         fs::write(&source, spec()).unwrap();
         let store = Store::open(temp.join("store"));
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['claude-code']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
         let identity = store.add_spec("build", &source).unwrap();
         assert_eq!(identity.name, "build");
         assert_eq!(store.list_specs().unwrap(), ["build"]);
@@ -1479,6 +1651,36 @@ mod tests {
         assert!(store.read_spec("build").is_ok());
         fs::remove_dir_all(temp).unwrap();
     }
+    #[test]
+    fn image_profiles_are_immutable_and_gate_harnesses_and_tools() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let profile = temp.join("agent.toml");
+        fs::write(&profile, b"version = 1\nharnesses = ['claude-code']\ntools = ['git']\n[source]\nreference = 'example:latest'\n").unwrap();
+        let identity = store.add_image("agent", &profile).unwrap();
+        assert_eq!(identity.name, "agent");
+        assert_eq!(store.list_images().unwrap(), ["agent"]);
+        assert!(store.add_image("agent", &profile).is_err());
+
+        let supported = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[tools]\nrequired = ['git']\n").unwrap();
+        store.validate_runtime_spec(&supported).unwrap();
+        let missing_tool = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[tools]\nrequired = ['go']\n").unwrap();
+        assert!(
+            store
+                .validate_runtime_spec(&missing_tool)
+                .unwrap_err()
+                .contains("required tool")
+        );
+        let unsupported_harness = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(
+            store
+                .validate_image_requirements(&unsupported_harness)
+                .unwrap_err()
+                .contains("does not support")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
     #[test]
     fn workspace_validation_detects_changed_sealed_input() {
         let temp = temporary_directory();
@@ -1511,7 +1713,7 @@ mod tests {
 
     #[test]
     fn rejects_workspace_mount_aliases_and_unsealed_dispatches() {
-        let spec = parse_spec(b"version=1\n[image]\nreference='x'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='claude-code'\ncommand=['claude']\n[[mounts]]\nname='tools'\ntarget='/workspace/.'\n").unwrap();
+        let spec = parse_spec(b"version=1\n[image]\nname='example'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='claude-code'\ncommand=['claude']\n[[mounts]]\nname='tools'\ntarget='/workspace/.'\n").unwrap();
         assert!(validate_spec(&spec).is_err());
 
         let temp = temporary_directory();
@@ -1527,7 +1729,7 @@ mod tests {
 
     #[test]
     fn bridge_specs_resolve_tool_installer_egress_and_bootstrap() {
-        let spec = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
         validate_spec(&spec).unwrap();
         assert_eq!(
             runtime_domains(&spec),
@@ -1585,20 +1787,20 @@ mod tests {
 
     #[test]
     fn pi_adapter_requires_a_supported_qualified_model() {
-        let valid = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'openai-codex/gpt-5.5:high'\n").unwrap();
+        let valid = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'openai-codex/gpt-5.5:high'\n").unwrap();
         validate_spec(&valid).unwrap();
         assert!(runtime_domains(&valid).contains(&"api.openai.com".to_owned()));
         assert!(runtime_domains(&valid).contains(&"chatgpt.com".to_owned()));
 
-        let missing_model = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
+        let missing_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
         assert!(validate_spec(&missing_model).unwrap_err().contains("model"));
-        let print_mode = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        let print_mode = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(
             validate_spec(&print_mode)
                 .unwrap_err()
                 .contains("dispatch or model-selection")
         );
-        let overridden_model = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        let overridden_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(validate_spec(&overridden_model).is_err());
         assert!(validate_dispatch_harness_args(&valid, &["--model=other".to_owned()]).is_err());
     }
@@ -1626,7 +1828,7 @@ mod tests {
 
     #[test]
     fn pi_docker_arguments_mount_managed_auth_and_select_model() {
-        let spec = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
         let temp = temporary_directory();
         let store = Store::open(temp.join("store"));
         let arguments = docker_arguments(
@@ -1665,13 +1867,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_firewall_and_offline_tool_specs() {
-        let malformed = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
+        let malformed = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
         assert!(
             validate_spec(&malformed)
                 .unwrap_err()
                 .contains("invalid firewall domain")
         );
-        let offline_tool = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
+        let offline_tool = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
         assert!(
             validate_spec(&offline_tool)
                 .unwrap_err()

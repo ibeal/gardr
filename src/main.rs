@@ -29,11 +29,15 @@ fn run() -> Result<(), String> {
             print!("{SPEC_HELP}");
             Ok(())
         }
+        "image" if subcommand_help(&args) => {
+            print!("{IMAGE_HELP}");
+            Ok(())
+        }
         "run" if subcommand_help(&args) => {
             print!("{RUN_HELP}");
             Ok(())
         }
-        command @ ("spec" | "run") => {
+        command @ ("spec" | "image" | "run") => {
             let root = root(
                 command_line_root,
                 env::var_os("GARDR_ROOT").map(PathBuf::from),
@@ -42,6 +46,7 @@ fn run() -> Result<(), String> {
             let store = Store::open(root);
             match command {
                 "spec" => spec(&store, args),
+                "image" => image(&store, args),
                 "run" => run_command(&store, args),
                 _ => unreachable!(),
             }
@@ -74,7 +79,48 @@ fn spec(store: &Store, mut args: Vec<String>) -> Result<(), String> {
         "validate" => {
             let name = take(&mut args)?;
             reject_extra(&args)?;
-            let (_, identity, _) = store.read_spec(&name)?;
+            let (spec, identity, _) = store.read_spec(&name)?;
+            store.validate_runtime_spec(&spec)?;
+            print_json(&identity)
+        }
+        _ => Err(usage()),
+    }
+}
+
+fn image(store: &Store, mut args: Vec<String>) -> Result<(), String> {
+    match take(&mut args)?.as_str() {
+        "add" => {
+            let name = take(&mut args)?;
+            let file =
+                option(&mut args, "--file").ok_or_else(|| "--file is required".to_owned())?;
+            reject_extra(&args)?;
+            print_json(&store.add_image(&name, PathBuf::from(file).as_path())?)
+        }
+        "list" => {
+            reject_extra(&args)?;
+            print_json(&store.list_images()?)
+        }
+        "show" => {
+            let name = take(&mut args)?;
+            reject_extra(&args)?;
+            let (_, identity, content) = store.read_image(&name)?;
+            println!("{}", String::from_utf8_lossy(&content));
+            eprintln!("sha256={}", identity.sha256);
+            Ok(())
+        }
+        "validate" => {
+            let name = take(&mut args)?;
+            reject_extra(&args)?;
+            let (image, identity, _) = store.read_image(&name)?;
+            if let Some(context) = &image.source.build_context {
+                let context = store.images_path().join(context);
+                if !context.join("Dockerfile").is_file() {
+                    return Err(format!(
+                        "image build context is missing Dockerfile: {}",
+                        context.display()
+                    ));
+                }
+            }
             print_json(&identity)
         }
         _ => Err(usage()),
@@ -167,9 +213,11 @@ fn usage() -> String {
     HELP.trim_end().to_owned()
 }
 
-const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  spec  Manage sandbox specifications\n  run   Manage workspace runs\n  docs  Print built-in guidance and examples\n  help  Print this message\n\nSpec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nRun `gardr spec --help` or `gardr run --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
+const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image Manage named image profiles\n  spec  Manage sandbox specifications\n  run   Manage workspace runs\n  docs  Print built-in guidance and examples\n  help  Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nRun `gardr spec --help` or `gardr run --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
 
 const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nUse `gardr docs` for the specification format.\n";
+
+const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nUse `gardr docs` for the image profile format.\n";
 
 const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name> [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
 
@@ -182,12 +230,17 @@ workspace, prepare an agent dispatch, or determine whether the agent completed i
 ## Root and store
 
 Gardr uses `~/.gardr` by default. Set `GARDR_ROOT` or pass `--root <path>` to select another root;
-`--root` wins. The root contains `specs/`, `runs/`, and optional approved `mounts/` and `images/`
-directories. Gardr creates `specs/` and `runs/` when they are first needed.
+`--root` wins. The root contains `specs/`, `runs/`, optional approved `mounts/`, and named image
+profiles plus optional build contexts under `images/`. Gardr creates managed directories when first needed.
 
 ## Commands
 
 ```text
+gardr image add <name> --file <path>     # validate and store an immutable image profile
+gardr image list                         # JSON list of stored image profiles
+gardr image show <name>                  # print the TOML and its SHA-256 to stderr
+gardr image validate <name>              # JSON identity for one image profile
+
 gardr spec add <name> --file <path>      # validate and store an immutable spec
 gardr spec list                          # JSON list of stored names
 gardr spec show <name>                   # print the TOML and its SHA-256 to stderr
@@ -209,8 +262,7 @@ All command results except `spec show` are one JSON document, intended for an or
 version = 1
 
 [image]
-reference = "ghcr.io/example/agent:latest"
-# build_context = "agent-image" # optional: <root>/images/agent-image/Dockerfile
+name = "claude-agent" # <root>/images/claude-agent.toml
 
 [sandbox]
 network = "none" # or "bridge" for Gardr's allowlisted egress firewall
@@ -243,9 +295,22 @@ install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "l
 allow = ["go.dev", "storage.googleapis.com"]
 ```
 
-Spec names, mount names, and build-context names select direct children of the approved root
-directories. A mount cannot target `/workspace`, and Gardr rejects unknown fields, duplicate mount
-names or targets, invalid container paths, and credential values.
+An image profile is host-owned policy and declares a single source, its supported harnesses, and the
+preinstalled tools it provides:
+
+```toml
+version = 1
+harnesses = ["claude-code"]
+tools = ["git", "node"]
+[source]
+build_context = "claude-agent" # <root>/images/claude-agent/Dockerfile
+```
+
+Specs select profiles by name. `tools.required` must be provided by that profile; `tools.install`
+remains for ephemeral missing-tool installation and never selects an image. Profile, spec, mount, and
+build-context names select approved children of the Gardr root. A mount cannot target `/workspace`,
+and Gardr rejects unknown fields, duplicate mount names or targets, invalid container paths, and
+credential values.
 
 Pi requires a provider-qualified `harness.model`; Gardr injects it as `--model`. It bootstraps the
 managed `<root>/pi/agent/` directory from only host `~/.pi/agent/auth.json`, mounts that at

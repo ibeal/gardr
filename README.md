@@ -6,7 +6,7 @@ workspace, provide agent context, read `HANDOFF.json`, or decide whether an agen
 
 `gardr` stores its data in `~/.gardr` by default. Set `GARDR_ROOT` or pass `--root` to override
 that location; `--root` takes precedence. Its store contains `specs/`, `runs/`, optional approved
-mount directories under `mounts/`, and optional Docker build contexts under `images/`.
+mount directories under `mounts/`, and named image profiles and optional Docker build contexts under `images/`.
 Those named directories are the only host paths a spec can request besides the supplied workspace.
 
 ```toml
@@ -14,8 +14,7 @@ Those named directories are the only host paths a spec can request besides the s
 version = 1
 
 [image]
-reference = "ghcr.io/example/agent:latest"
-# build_context = "agent-image" # resolves only to the configured root's images/agent-image
+name = "pi-agent" # resolves only to the configured root's images/pi-agent.toml
 
 [sandbox]
 network = "none" # use "bridge" for Gardr's allowlisted egress firewall
@@ -52,6 +51,8 @@ allow = ["go.dev", "storage.googleapis.com"]
 ```
 
 ```sh
+gardr image add pi-agent --file pi-agent.toml
+gardr image validate pi-agent
 gardr spec add build --file build.toml
 gardr spec validate build
 gardr spec list
@@ -66,6 +67,17 @@ does not inspect a workspace, stream logs, attach a terminal, or interpret hando
 run writes immutable `spec.toml` and `resolved.json`, then mutable `state.json` and `runner.log`
 under the configured root's `runs/<run-id>/`. Resume validates the sealed workspace and uses the frozen spec;
 it never silently replaces state. Cleanup is idempotent and refuses a running run.
+
+Image profiles are immutable, host-owned runtime policy. A profile chooses exactly one source: an image reference or an approved build context at `<root>/images/<context>/Dockerfile`; it lists the harness adapters and preinstalled tools it provides. Specs select profiles by name and may declare `tools.required` capabilities that the profile must provide. Gardr resolves the profile and records its identity and Docker image ID in the run metadata. It does not select an image from imperative `tools.install` commands or use a remote image registry.
+
+```toml
+# pi-agent.toml
+version = 1
+harnesses = ["pi"]
+tools = ["git", "node"]
+[source]
+reference = "ghcr.io/example/pi-agent@sha256:..."
+```
 
 The initial backend is Docker. Gardr runs the workspace at `/workspace`, selected approved mounts
 at their declared targets, the declared Docker network policy, and only referenced credential
