@@ -24,6 +24,12 @@ network = "none" # use "bridge" for Gardr's allowlisted egress firewall
 adapter = "claude-code"
 command = ["claude", "-p", "complete the assigned work"]
 
+# Or use Pi. `command` contains only reusable harness arguments; the
+# dispatch supplies prompt/print arguments through `run start --harness-arg`.
+# adapter = "pi"
+# command = ["pi", "--no-session"]
+# model = "anthropic/claude-opus-4-6:high"
+
 [[mounts]]
 name = "tools"                  # resolves only to the configured root's mounts/tools
 target = "/tools"
@@ -49,7 +55,7 @@ allow = ["go.dev", "storage.googleapis.com"]
 gardr spec add build --file build.toml
 gardr spec validate build
 gardr spec list
-gardr run start --workspace /workspaces/task --spec build
+gardr run start --workspace /workspaces/task --spec build --harness-arg -p --harness-arg "complete the assigned work"
 gardr run observe run-…
 gardr run stop run-…
 gardr run cleanup run-…
@@ -78,6 +84,12 @@ read-only and reconciles the container's current status and known exit code for 
 `run stop`, `run resume`, and `run cleanup` persist their lifecycle transitions; cleanup removes a
 non-running container and is idempotent. An unavailable container or incomplete resolved state is
 reported as an explicit runner failure rather than treated as agent-workflow success.
+
+For `adapter = "pi"`, Gardr bootstraps its managed `<root>/pi/agent/` directory from only the
+host `~/.pi/agent/auth.json`, mounts that directory at `/pi-agent`, and sets
+`PI_CODING_AGENT_DIR`. Pi's `--model` is injected from the required provider-qualified
+`harness.model`. The initial supported providers are `anthropic` and `openai-codex`; their
+runtime API domains are added to bridge egress. Gardr never mounts the host Pi directory.
 
 For `network = "bridge"`, Gardr follows the containerized-agent firewall model: it resolves each
 allowed domain at startup, adds the resolved IPs to an ipset, pins the selected address in

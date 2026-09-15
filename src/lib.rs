@@ -36,6 +36,9 @@ impl Store {
     pub fn images_path(&self) -> PathBuf {
         self.root.join("images")
     }
+    pub fn pi_agent_path(&self) -> PathBuf {
+        self.root.join("pi").join("agent")
+    }
     pub fn spec_path(&self, name: &str) -> Result<PathBuf> {
         validate_name("spec name", name)?;
         Ok(self.specs_path().join(format!("{name}.toml")))
@@ -100,9 +103,17 @@ impl Store {
         Ok(names)
     }
 
-    pub fn create_run(&self, workspace: &Path, spec_name: &str) -> Result<(RunRecord, Spec)> {
+    pub fn create_run(
+        &self,
+        workspace: &Path,
+        spec_name: &str,
+        harness_args: Vec<String>,
+    ) -> Result<(RunRecord, Spec)> {
         let workspace = validate_workspace(workspace)?;
+        validate_harness_args(&harness_args)?;
         let (spec, identity, content) = self.read_spec(spec_name)?;
+        validate_dispatch_harness_args(&spec, &harness_args)?;
+        sync_pi_auth(self, &spec)?;
         validate_runtime_spec(self, &spec)?;
         fs::create_dir_all(self.runs_path()).map_err(io_error)?;
         let id = new_run_id();
@@ -123,6 +134,7 @@ impl Store {
             state_path: directory.display().to_string(),
             log_path: directory.join("runner.log").display().to_string(),
             artifact_path: directory.join("artifacts").display().to_string(),
+            harness_args,
         };
         write_new(&directory.join("spec.toml"), &content)?;
         write_new(
@@ -200,8 +212,13 @@ impl Store {
         self.launch(record, workspace, spec)
     }
 
-    pub fn start(&self, workspace: &Path, spec_name: &str) -> Result<RunRecord> {
-        let (record, spec) = self.create_run(workspace, spec_name)?;
+    pub fn start(
+        &self,
+        workspace: &Path,
+        spec_name: &str,
+        harness_args: Vec<String>,
+    ) -> Result<RunRecord> {
+        let (record, spec) = self.create_run(workspace, spec_name, harness_args)?;
         let workspace = PathBuf::from(&record.workspace);
         self.launch(record, workspace, spec)
     }
@@ -302,7 +319,14 @@ impl Store {
                 Err(error) => return fail_run(&directory, &mut record, error),
             },
         };
-        let arguments = match docker_arguments(self, &spec, &workspace, &directory, &image) {
+        let arguments = match docker_arguments(
+            self,
+            &spec,
+            &workspace,
+            &directory,
+            &image,
+            &record.harness_args,
+        ) {
             Ok(arguments) => arguments,
             Err(error) => return fail_run(&directory, &mut record, error),
         };
@@ -383,11 +407,14 @@ pub struct Harness {
     pub adapter: Adapter,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
     ClaudeCode,
+    Pi,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -446,6 +473,8 @@ pub struct RunRecord {
     pub state_path: String,
     pub log_path: String,
     pub artifact_path: String,
+    #[serde(default)]
+    pub harness_args: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -478,6 +507,12 @@ struct ResolvedConfig<'a> {
     credentials: &'a Credentials,
     firewall: ResolvedFirewall,
     tools: &'a Tooling,
+    pi_agent: Option<ResolvedPiAgent>,
+}
+#[derive(Serialize)]
+struct ResolvedPiAgent {
+    source: String,
+    target: &'static str,
 }
 #[derive(Serialize)]
 struct ResolvedFirewall {
@@ -523,6 +558,10 @@ impl<'a> ResolvedConfig<'a> {
                 effective: installer_domains(spec),
             },
             tools: &spec.tools,
+            pi_agent: matches!(spec.harness.adapter, Adapter::Pi).then(|| ResolvedPiAgent {
+                source: store.pi_agent_path().display().to_string(),
+                target: "/pi-agent",
+            }),
         }
     }
 }
@@ -546,16 +585,48 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
     if spec.harness.command.is_empty() {
         return Err("harness.command is required".to_owned());
     }
-    if !matches!(spec.harness.adapter, Adapter::ClaudeCode)
-        || spec
-            .harness
-            .command
-            .first()
-            .is_none_or(|command| command != "claude")
-    {
-        return Err(
-            "the claude-code adapter requires a command beginning with `claude`".to_owned(),
-        );
+    match spec.harness.adapter {
+        Adapter::ClaudeCode
+            if spec
+                .harness
+                .command
+                .first()
+                .is_some_and(|command| command == "claude")
+                && spec.harness.model.is_none() => {}
+        Adapter::ClaudeCode => {
+            return Err(
+                "the claude-code adapter requires a command beginning with `claude` and no model"
+                    .to_owned(),
+            );
+        }
+        Adapter::Pi
+            if spec
+                .harness
+                .command
+                .first()
+                .is_some_and(|command| command == "pi") =>
+        {
+            let model = spec
+                .harness
+                .model
+                .as_deref()
+                .ok_or_else(|| "the pi adapter requires harness.model".to_owned())?;
+            validate_pi_model(model)?;
+            if spec
+                .harness
+                .command
+                .iter()
+                .any(|argument| is_pi_reserved_argument(argument))
+            {
+                return Err(
+                    "the pi adapter command must not contain dispatch or model-selection arguments"
+                        .to_owned(),
+                );
+            }
+        }
+        Adapter::Pi => {
+            return Err("the pi adapter requires a command beginning with `pi`".to_owned());
+        }
     }
     let mut names = BTreeSet::new();
     let mut targets = BTreeSet::new();
@@ -606,6 +677,9 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
 }
 
 fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<()> {
+    if matches!(spec.harness.adapter, Adapter::Pi) {
+        validate_pi_agent(store)?;
+    }
     for mount in &spec.mounts {
         approved_child(&store.mounts_path(), &mount.name)?;
     }
@@ -816,6 +890,7 @@ fn docker_arguments(
     workspace: &Path,
     run_directory: &Path,
     image: &str,
+    harness_args: &[String],
 ) -> Result<Vec<String>> {
     validate_docker_path("workspace path", workspace)?;
     validate_docker_path("run directory", run_directory)?;
@@ -864,6 +939,18 @@ fn docker_arguments(
             ),
         ]);
     }
+    if matches!(spec.harness.adapter, Adapter::Pi) {
+        let agent = store.pi_agent_path();
+        validate_docker_path("Pi agent path", &agent)?;
+        args.extend([
+            "--env".to_owned(),
+            "PI_CODING_AGENT_DIR=/pi-agent".to_owned(),
+            "--env".to_owned(),
+            "PI_SKIP_VERSION_CHECK=1".to_owned(),
+            "--mount".to_owned(),
+            format!("type=bind,source={},target=/pi-agent", agent.display()),
+        ]);
+    }
     for reference in &spec.credentials.environment {
         if std::env::var_os(reference).is_none() {
             return Err(format!("required credential is not set: {reference}"));
@@ -878,7 +965,12 @@ fn docker_arguments(
             "gardr-bootstrap".to_owned(),
         ]);
     }
-    args.extend(spec.harness.command.clone());
+    let mut command = spec.harness.command.clone();
+    if let Some(model) = &spec.harness.model {
+        command.splice(1..1, ["--model".to_owned(), model.clone()]);
+    }
+    command.extend(harness_args.iter().cloned());
+    args.extend(command);
     Ok(args)
 }
 
@@ -898,10 +990,99 @@ fn runtime_domains(spec: &Spec) -> Vec<String> {
     FIREWALL_MINIMUM
         .iter()
         .map(|domain| (*domain).to_owned())
+        .chain(
+            pi_runtime_domains(spec)
+                .iter()
+                .map(|domain| (*domain).to_owned()),
+        )
         .chain(spec.firewall.allow.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn pi_runtime_domains(spec: &Spec) -> &'static [&'static str] {
+    let provider = spec
+        .harness
+        .model
+        .as_deref()
+        .and_then(|model| model.split_once('/').map(|(provider, _)| provider));
+    match provider {
+        Some("anthropic") => &["api.anthropic.com"],
+        Some("openai-codex") => &["api.openai.com", "chatgpt.com"],
+        _ => &[],
+    }
+}
+
+fn validate_pi_model(value: &str) -> Result<()> {
+    let (provider, model) = value
+        .split_once('/')
+        .ok_or_else(|| "Pi model must be provider-qualified".to_owned())?;
+    if provider.is_empty()
+        || model.is_empty()
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':')
+        })
+    {
+        return Err(format!("invalid Pi model: {value}"));
+    }
+    if !matches!(provider, "anthropic" | "openai-codex") {
+        return Err(format!("unsupported Pi model provider: {provider}"));
+    }
+    Ok(())
+}
+
+fn sync_pi_auth(store: &Store, spec: &Spec) -> Result<()> {
+    if !matches!(spec.harness.adapter, Adapter::Pi) {
+        return Ok(());
+    }
+    if store.pi_agent_path().join("auth.json").exists() {
+        return validate_pi_agent(store);
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "unable to locate host Pi authentication: HOME is not set".to_owned())?;
+    sync_pi_auth_from(store, PathBuf::from(home).join(".pi/agent/auth.json"))
+}
+
+fn validate_pi_agent(store: &Store) -> Result<()> {
+    let agent = store.pi_agent_path();
+    let directory = fs::symlink_metadata(&agent)
+        .map_err(|_| "managed Pi authentication is unavailable".to_owned())?;
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err("managed Pi authentication directory is invalid".to_owned());
+    }
+    let auth = agent.join("auth.json");
+    let file = fs::symlink_metadata(&auth)
+        .map_err(|_| "managed Pi authentication is unavailable".to_owned())?;
+    if !file.is_file() || file.file_type().is_symlink() {
+        return Err("managed Pi authentication file is invalid".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if directory.permissions().mode() & 0o077 != 0 || file.permissions().mode() & 0o077 != 0 {
+            return Err("managed Pi authentication permissions are not private".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn sync_pi_auth_from(store: &Store, source: PathBuf) -> Result<()> {
+    let auth = fs::read(&source).map_err(|error| {
+        format!(
+            "unable to read host Pi authentication {}: {error}",
+            source.display()
+        )
+    })?;
+    let agent = store.pi_agent_path();
+    fs::create_dir_all(&agent).map_err(io_error)?;
+    set_private_directory(&agent)?;
+    let destination = agent.join("auth.json");
+    atomic_write(&destination, &auth)?;
+    set_private_file(&destination)
 }
 
 fn installer_domains(spec: &Spec) -> Vec<String> {
@@ -956,6 +1137,24 @@ fn write_bootstrap(directory: &Path, spec: &Spec) -> Result<()> {
     set_executable(&bootstrap)
 }
 
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_error)
+}
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+#[cfg(unix)]
+fn set_private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_error)
+}
+#[cfg(not(unix))]
+fn set_private_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1171,6 +1370,34 @@ fn validate_domain(value: &str) -> Result<()> {
         Ok(())
     }
 }
+fn validate_harness_args(arguments: &[String]) -> Result<()> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        validate_command("harness arguments", arguments)
+    }
+}
+fn validate_dispatch_harness_args(spec: &Spec, arguments: &[String]) -> Result<()> {
+    if matches!(spec.harness.adapter, Adapter::Pi)
+        && arguments
+            .iter()
+            .any(|argument| is_pi_model_selection_argument(argument))
+    {
+        return Err("Pi dispatch arguments must not select a model or provider".to_owned());
+    }
+    Ok(())
+}
+fn is_pi_reserved_argument(argument: &str) -> bool {
+    matches!(argument, "-p" | "--print" | "--") || is_pi_model_selection_argument(argument)
+}
+fn is_pi_model_selection_argument(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--model" | "--provider" | "--api-key" | "--thinking"
+    ) || ["--model=", "--provider=", "--api-key=", "--thinking="]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix))
+}
 fn validate_command(label: &str, command: &[String]) -> Result<()> {
     if command.is_empty()
         || command.iter().any(|word| {
@@ -1334,6 +1561,7 @@ mod tests {
             &temp,
             &temp,
             "image-id",
+            &[],
         )
         .unwrap();
         assert!(
@@ -1352,6 +1580,86 @@ mod tests {
         let bootstrap = fs::read_to_string(temp.join("tool-bootstrap.sh")).unwrap();
         assert!(bootstrap.contains("runtime-domains.txt"));
         assert!(bootstrap.contains("shift\nexec \"$@\""));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn pi_adapter_requires_a_supported_qualified_model() {
+        let valid = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'openai-codex/gpt-5.5:high'\n").unwrap();
+        validate_spec(&valid).unwrap();
+        assert!(runtime_domains(&valid).contains(&"api.openai.com".to_owned()));
+        assert!(runtime_domains(&valid).contains(&"chatgpt.com".to_owned()));
+
+        let missing_model = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
+        assert!(validate_spec(&missing_model).unwrap_err().contains("model"));
+        let print_mode = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(
+            validate_spec(&print_mode)
+                .unwrap_err()
+                .contains("dispatch or model-selection")
+        );
+        let overridden_model = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(validate_spec(&overridden_model).is_err());
+        assert!(validate_dispatch_harness_args(&valid, &["--model=other".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn pi_auth_is_staged_in_the_managed_directory() {
+        let temp = temporary_directory();
+        let source = temp.join("host-auth.json");
+        fs::write(&source, b"{\"openai-codex\":{}}\n").unwrap();
+        let store = Store::open(temp.join("store"));
+        sync_pi_auth_from(&store, source).unwrap();
+        let managed_auth = store.pi_agent_path().join("auth.json");
+        assert_eq!(fs::read(&managed_auth).unwrap(), b"{\"openai-codex\":{}}\n");
+        validate_pi_agent(&store).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&managed_auth).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn pi_docker_arguments_mount_managed_auth_and_select_model() {
+        let spec = parse_spec(b"version = 1\n[image]\nreference = 'example:latest'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let arguments = docker_arguments(
+            &store,
+            &spec,
+            &temp,
+            &temp,
+            "image-id",
+            &["-p".to_owned(), "complete the assigned work".to_owned()],
+        )
+        .unwrap();
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "PI_CODING_AGENT_DIR=/pi-agent")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "PI_SKIP_VERSION_CHECK=1")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.contains("target=/pi-agent"))
+        );
+        assert!(arguments.windows(2).any(|pair| pair == ["pi", "--model"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "anthropic/claude-opus-4-6:high"])
+        );
+        assert!(arguments.ends_with(&["-p".to_owned(), "complete the assigned work".to_owned()]));
         fs::remove_dir_all(temp).unwrap();
     }
 

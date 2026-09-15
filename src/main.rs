@@ -88,8 +88,9 @@ fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
                 .ok_or_else(|| "--workspace is required".to_owned())?;
             let spec =
                 option(&mut args, "--spec").ok_or_else(|| "--spec is required".to_owned())?;
+            let harness_args = options(&mut args, "--harness-arg");
             reject_extra(&args)?;
-            print_json(&store.start(PathBuf::from(workspace).as_path(), &spec)?)
+            print_json(&store.start(PathBuf::from(workspace).as_path(), &spec, harness_args)?)
         }
         "observe" => {
             let id = take(&mut args)?;
@@ -131,6 +132,13 @@ fn option(args: &mut Vec<String>, flag: &str) -> Option<String> {
             (index < args.len()).then(|| args.remove(index))
         })
 }
+fn options(args: &mut Vec<String>, flag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    while let Some(value) = option(args, flag) {
+        values.push(value);
+    }
+    values
+}
 fn take(args: &mut Vec<String>) -> Result<String, String> {
     if args.is_empty() {
         Err(usage())
@@ -163,7 +171,7 @@ const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nU
 
 const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nUse `gardr docs` for the specification format.\n";
 
-const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name>\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
+const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name> [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
 
 const DOCS: &str = r#"# gardr — durable sandbox execution
 
@@ -186,7 +194,7 @@ gardr spec show <name>                   # print the TOML and its SHA-256 to std
 gardr spec validate <name>               # JSON identity for one stored spec
 
 gardr run validate-workspace <path>      # validate a prepared, sealed workspace
-gardr run start --workspace <path> --spec <name>
+gardr run start --workspace <path> --spec <name> [--harness-arg <arg>]...
 gardr run observe <run-id>               # reconcile and return current run state
 gardr run resume <run-id>                # restart a stopped or failed run
 gardr run stop <run-id>                  # stop a running container
@@ -211,6 +219,12 @@ network = "none" # or "bridge" for Gardr's allowlisted egress firewall
 adapter = "claude-code"
 command = ["claude", "-p", "complete the assigned work"]
 
+# Or use Pi. `command` holds reusable harness arguments; dispatch arguments
+# such as `-p` belong to `run start --harness-arg`, not this spec.
+# adapter = "pi"
+# command = ["pi", "--no-session"]
+# model = "anthropic/claude-opus-4-6:high"
+
 [[mounts]]
 name = "tools"                  # resolves only to <root>/mounts/tools
 target = "/tools"
@@ -232,6 +246,11 @@ allow = ["go.dev", "storage.googleapis.com"]
 Spec names, mount names, and build-context names select direct children of the approved root
 directories. A mount cannot target `/workspace`, and Gardr rejects unknown fields, duplicate mount
 names or targets, invalid container paths, and credential values.
+
+Pi requires a provider-qualified `harness.model`; Gardr injects it as `--model`. It bootstraps the
+managed `<root>/pi/agent/` directory from only host `~/.pi/agent/auth.json`, mounts that at
+`/pi-agent`, and sets `PI_CODING_AGENT_DIR`; it never mounts the host Pi directory. The initial
+supported providers are `anthropic` and `openai-codex`, whose API domains are added to bridge egress.
 
 Bridge runs get Gardr's minimum firewall allowlist plus `[firewall].allow`. Gardr resolves and pins
 each allowed address, allows tool-specific egress only while a missing tool is installed, then
@@ -295,6 +314,21 @@ mod tests {
     fn help_documents_the_default_root_and_docs_command() {
         assert!(HELP.contains("~/.gardr by default"));
         assert!(HELP.contains("docs  Print built-in guidance"));
+    }
+
+    #[test]
+    fn repeated_harness_arguments_preserve_dispatch_order() {
+        let mut args = vec![
+            "--harness-arg".to_owned(),
+            "-p".to_owned(),
+            "--harness-arg".to_owned(),
+            "complete the assigned work".to_owned(),
+        ];
+        assert_eq!(
+            options(&mut args, "--harness-arg"),
+            ["-p", "complete the assigned work"]
+        );
+        assert!(args.is_empty());
     }
 
     #[test]
