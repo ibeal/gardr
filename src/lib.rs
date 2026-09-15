@@ -398,6 +398,7 @@ impl Store {
             &spec,
             &workspace,
             &directory,
+            &record.id,
             &image,
             &record.harness_args,
         ) {
@@ -1054,6 +1055,7 @@ fn docker_arguments(
     spec: &Spec,
     workspace: &Path,
     run_directory: &Path,
+    run_id: &str,
     image: &str,
     harness_args: &[String],
 ) -> Result<Vec<String>> {
@@ -1062,6 +1064,8 @@ fn docker_arguments(
     let mut args = vec![
         "run".to_owned(),
         "--detach".to_owned(),
+        "--name".to_owned(),
+        run_id.to_owned(),
         "--network".to_owned(),
         match spec.sandbox.network {
             Network::None => "none",
@@ -1762,6 +1766,7 @@ mod tests {
             &spec,
             &temp,
             &temp,
+            "run-test",
             "image-id",
             &[],
         )
@@ -1836,6 +1841,7 @@ mod tests {
             &spec,
             &temp,
             &temp,
+            "run-test",
             "image-id",
             &["-p".to_owned(), "complete the assigned work".to_owned()],
         )
