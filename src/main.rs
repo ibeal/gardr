@@ -215,9 +215,9 @@ fn usage() -> String {
 
 const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image Manage named image profiles\n  spec  Manage sandbox specifications\n  run   Manage workspace runs\n  docs  Print built-in guidance and examples\n  help  Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nRun `gardr spec --help` or `gardr run --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
 
-const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nUse `gardr docs` for the specification format.\n";
+const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the specification format.\n";
 
-const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nUse `gardr docs` for the image profile format.\n";
+const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
 const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name> [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
 
@@ -268,14 +268,10 @@ name = "claude-agent" # <root>/images/claude-agent.toml
 network = "none" # or "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
-adapter = "claude-code"
-command = ["claude", "-p", "complete the assigned work"]
-
-# Or use Pi. `command` holds reusable harness arguments; dispatch arguments
-# such as `-p` belong to `run start --harness-arg`, not this spec.
-# adapter = "pi"
-# command = ["pi", "--no-session"]
-# model = "anthropic/claude-opus-4-6:high"
+adapter = "pi"          # the only supported adapter today; see note below
+command = ["pi", "--no-session"] # reusable harness arguments; dispatch arguments
+                                  # such as `-p` belong to `run start --harness-arg`
+model = "anthropic/claude-opus-4-6:high"
 
 [[mounts]]
 name = "tools"                  # resolves only to <root>/mounts/tools
@@ -300,7 +296,7 @@ preinstalled tools it provides:
 
 ```toml
 version = 1
-harnesses = ["claude-code"]
+harnesses = ["pi"]
 tools = ["git", "node"]
 [source]
 build_context = "claude-agent" # <root>/images/claude-agent/Dockerfile
@@ -311,6 +307,10 @@ remains for ephemeral missing-tool installation and never selects an image. Prof
 build-context names select approved children of the Gardr root. A mount cannot target `/workspace`,
 and Gardr rejects unknown fields, duplicate mount names or targets, invalid container paths, and
 credential values.
+
+`claude-code` is a recognized `harness.adapter` value but is not a supported harness today: it has
+no credential-bootstrap mechanism, so `gardr spec add` and `gardr image add` both reject it at store
+time. Use `pi` with an Anthropic model instead.
 
 Pi requires a provider-qualified `harness.model`; Gardr injects it as `--model`. It bootstraps the
 managed `<root>/pi/agent/` directory from only host `~/.pi/agent/auth.json`, mounts that at

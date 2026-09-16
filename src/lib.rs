@@ -508,6 +508,7 @@ pub enum Adapter {
     ClaudeCode,
     Pi,
 }
+pub const CLAUDE_CODE_UNSUPPORTED: &str = "the claude-code adapter is not supported: it has no credential bootstrap yet; use the pi adapter with an Anthropic model instead";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
@@ -681,6 +682,13 @@ pub fn validate_image_profile(image: &ImageProfile) -> Result<()> {
     if image.version != 1 {
         return Err("image profile version must be 1".to_owned());
     }
+    if image
+        .harnesses
+        .iter()
+        .any(|adapter| matches!(adapter, Adapter::ClaudeCode))
+    {
+        return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
+    }
     match (&image.source.reference, &image.source.build_context) {
         (Some(reference), None) if !reference.trim().is_empty() => {}
         (None, Some(context)) => validate_name("image build_context", context)?,
@@ -712,18 +720,8 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         return Err("harness.command is required".to_owned());
     }
     match spec.harness.adapter {
-        Adapter::ClaudeCode
-            if spec
-                .harness
-                .command
-                .first()
-                .is_some_and(|command| command == "claude")
-                && spec.harness.model.is_none() => {}
         Adapter::ClaudeCode => {
-            return Err(
-                "the claude-code adapter requires a command beginning with `claude` and no model"
-                    .to_owned(),
-            );
+            return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
         }
         Adapter::Pi
             if spec
@@ -1635,7 +1633,7 @@ mod tests {
         path
     }
     fn spec() -> &'static [u8] {
-        b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n"
+        b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n"
     }
     #[test]
     fn specs_are_validated_and_immutable() {
@@ -1646,7 +1644,7 @@ mod tests {
         let image_source = temp.join("example.toml");
         fs::write(
             &image_source,
-            b"version = 1\nharnesses = ['claude-code']\n[source]\nreference = 'example:latest'\n",
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
         )
         .unwrap();
         store.add_image("example", &image_source).unwrap();
@@ -1662,22 +1660,29 @@ mod tests {
         let temp = temporary_directory();
         let store = Store::open(temp.join("store"));
         let profile = temp.join("agent.toml");
-        fs::write(&profile, b"version = 1\nharnesses = ['claude-code']\ntools = ['git']\n[source]\nreference = 'example:latest'\n").unwrap();
+        fs::write(&profile, b"version = 1\nharnesses = ['pi']\ntools = ['git']\n[source]\nreference = 'example:latest'\n").unwrap();
         let identity = store.add_image("agent", &profile).unwrap();
         assert_eq!(identity.name, "agent");
         assert_eq!(store.list_images().unwrap(), ["agent"]);
         assert!(store.add_image("agent", &profile).is_err());
 
-        let supported = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[tools]\nrequired = ['git']\n").unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+
+        let supported = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[tools]\nrequired = ['git']\n").unwrap();
         store.validate_runtime_spec(&supported).unwrap();
-        let missing_tool = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[tools]\nrequired = ['go']\n").unwrap();
+        let missing_tool = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[tools]\nrequired = ['go']\n").unwrap();
         assert!(
             store
                 .validate_runtime_spec(&missing_tool)
                 .unwrap_err()
                 .contains("required tool")
         );
-        let unsupported_harness = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        // claude-code is used here (bypassing validate_spec, which now rejects it) solely to
+        // exercise the image/adapter mismatch path with a second Adapter discriminant.
+        let unsupported_harness = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n").unwrap();
         assert!(
             store
                 .validate_image_requirements(&unsupported_harness)
@@ -1714,12 +1719,12 @@ mod tests {
     }
     #[test]
     fn rejects_unapproved_spec_fields() {
-        assert!(parse_spec(b"version=1\nextra=true\n[image]\nreference='x'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='claude-code'\ncommand=['x']\n").is_err());
+        assert!(parse_spec(b"version=1\nextra=true\n[image]\nreference='x'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='pi'\ncommand=['x']\n").is_err());
     }
 
     #[test]
     fn rejects_workspace_mount_aliases_and_unsealed_dispatches() {
-        let spec = parse_spec(b"version=1\n[image]\nname='example'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='claude-code'\ncommand=['claude']\n[[mounts]]\nname='tools'\ntarget='/workspace/.'\n").unwrap();
+        let spec = parse_spec(b"version=1\n[image]\nname='example'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='pi'\ncommand=['pi']\nmodel='anthropic/claude-opus-4-6'\n[[mounts]]\nname='tools'\ntarget='/workspace/.'\n").unwrap();
         assert!(validate_spec(&spec).is_err());
 
         let temp = temporary_directory();
@@ -1735,7 +1740,7 @@ mod tests {
 
     #[test]
     fn bridge_specs_resolve_tool_installer_egress_and_bootstrap() {
-        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
         validate_spec(&spec).unwrap();
         assert_eq!(
             runtime_domains(&spec),
@@ -1877,17 +1882,49 @@ mod tests {
 
     #[test]
     fn rejects_malformed_firewall_and_offline_tool_specs() {
-        let malformed = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
+        let malformed = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
         assert!(
             validate_spec(&malformed)
                 .unwrap_err()
                 .contains("invalid firewall domain")
         );
-        let offline_tool = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
+        let offline_tool = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
         assert!(
             validate_spec(&offline_tool)
                 .unwrap_err()
                 .contains("tools require")
         );
+    }
+
+    #[test]
+    fn spec_add_rejects_claude_code_adapter_at_store_time() {
+        let temp = temporary_directory();
+        let source = temp.join("spec.toml");
+        fs::write(
+            &source,
+            b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'claude-code'\ncommand = ['claude', '-p']\n",
+        )
+        .unwrap();
+        let store = Store::open(temp.join("store"));
+        let error = store.add_spec("build", &source).unwrap_err();
+        assert_eq!(error, CLAUDE_CODE_UNSUPPORTED);
+        assert!(!store.spec_path("build").unwrap().exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn image_add_rejects_claude_code_harness_at_store_time() {
+        let temp = temporary_directory();
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['claude-code']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        let store = Store::open(temp.join("store"));
+        let error = store.add_image("agent", &profile).unwrap_err();
+        assert_eq!(error, CLAUDE_CODE_UNSUPPORTED);
+        assert!(!store.image_path("agent").unwrap().exists());
+        fs::remove_dir_all(temp).unwrap();
     }
 }
