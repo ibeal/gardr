@@ -716,12 +716,15 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         return Err("run spec version must be 1".to_owned());
     }
     validate_name("image name", &spec.image.name)?;
+    if matches!(spec.harness.adapter, Adapter::ClaudeCode) {
+        return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
+    }
     if spec.harness.command.is_empty() {
         return Err("harness.command is required".to_owned());
     }
     match spec.harness.adapter {
         Adapter::ClaudeCode => {
-            return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
+            unreachable!("claude-code rejected above")
         }
         Adapter::Pi
             if spec
@@ -1919,6 +1922,22 @@ mod tests {
         fs::write(
             &profile,
             b"version = 1\nharnesses = ['claude-code']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        let store = Store::open(temp.join("store"));
+        let error = store.add_image("agent", &profile).unwrap_err();
+        assert_eq!(error, CLAUDE_CODE_UNSUPPORTED);
+        assert!(!store.image_path("agent").unwrap().exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn image_add_rejects_mixed_claude_code_and_pi_harnesses_at_store_time() {
+        let temp = temporary_directory();
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['claude-code', 'pi']\n[source]\nreference = 'example:latest'\n",
         )
         .unwrap();
         let store = Store::open(temp.join("store"));

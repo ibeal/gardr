@@ -20,14 +20,14 @@ name = "pi-agent" # resolves only to the configured root's images/pi-agent.toml
 network = "none" # use "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
-adapter = "claude-code"
-command = ["claude", "-p", "complete the assigned work"]
+adapter = "pi"
+# `command` contains only reusable harness arguments; the dispatch supplies
+# prompt/print arguments through `run start --harness-arg`.
+command = ["pi", "--no-session"]
+model = "anthropic/claude-opus-4-6:high"
 
-# Or use Pi. `command` contains only reusable harness arguments; the
-# dispatch supplies prompt/print arguments through `run start --harness-arg`.
-# adapter = "pi"
-# command = ["pi", "--no-session"]
-# model = "anthropic/claude-opus-4-6:high"
+# The claude-code adapter has no credential bootstrap yet and is rejected at
+# `spec add`/`image add` store time; use pi instead.
 
 [[mounts]]
 name = "tools"                  # resolves only to the configured root's mounts/tools
