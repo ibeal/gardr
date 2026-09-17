@@ -333,6 +333,14 @@ Each run has a directory at `<root>/runs/<run-id>/` containing the frozen `spec.
 configuration, run state, mount lock, runner log, and artifacts directory. `resume` revalidates the
 workspace seal, frozen spec, and approved mounts before launching again. `cleanup` is terminal and
 refuses a running run; stop it first.
+
+For the pi adapter, Gardr always writes pi's session transcript to
+`<root>/runs/<run-id>/transcript/session.jsonl`, overriding any `--no-session` left in a spec's
+reusable `harness.command` so existing specs keep working unmodified. Regardless of adapter,
+`cleanup` captures the container's raw stdout/stderr to `<root>/runs/<run-id>/stdout.log` and
+`stderr.log` before `docker rm`, whatever the harness's exit status. `run observe`'s JSON `usage`
+field reports token counts and total cost read live from the pi transcript, once one exists; there
+is no separate cost command.
 "#;
 
 fn root(

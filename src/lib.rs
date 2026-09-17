@@ -205,8 +205,16 @@ impl Store {
             log_path: directory.join("runner.log").display().to_string(),
             artifact_path: directory.join("artifacts").display().to_string(),
             harness_args,
+            transcript_path: matches!(spec.harness.adapter, Adapter::Pi)
+                .then(|| directory.join("transcript").join("session.jsonl").display().to_string()),
+            stdout_path: directory.join("stdout.log").display().to_string(),
+            stderr_path: directory.join("stderr.log").display().to_string(),
+            usage: None,
         };
         write_new(&directory.join("spec.toml"), &content)?;
+        if matches!(spec.harness.adapter, Adapter::Pi) {
+            fs::create_dir(directory.join("transcript")).map_err(io_error)?;
+        }
         let mounts = lock_mounts(self, &spec)?;
         write_new(
             &directory.join("mounts.json"),
@@ -304,6 +312,10 @@ impl Store {
                 }
             }
         }
+        record.usage = record
+            .transcript_path
+            .as_deref()
+            .and_then(|path| read_pi_transcript_usage(Path::new(path)));
         Ok(record)
     }
 
@@ -348,6 +360,9 @@ impl Store {
         let directory = self.run_path(id)?;
         if directory.join("cleanup.complete").exists() {
             return Ok(());
+        }
+        if let Some(container) = &record.container {
+            capture_container_logs(container, &directory)?;
         }
         if let Some(container) = record.container {
             let output = Command::new("docker")
@@ -498,6 +513,8 @@ pub enum Adapter {
     Pi,
 }
 pub const CLAUDE_CODE_UNSUPPORTED: &str = "the claude-code adapter is not supported: it has no credential bootstrap yet; use the pi adapter with an Anthropic model instead";
+/// Container path where the pi adapter's writable transcript directory is mounted.
+const PI_TRANSCRIPT_MOUNT: &str = "/gardr-transcript";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
@@ -561,6 +578,30 @@ pub struct RunRecord {
     pub artifact_path: String,
     #[serde(default)]
     pub harness_args: Vec<String>,
+    /// Path under this run's directory where the pi adapter's session transcript is written.
+    /// `None` for adapters without transcript support.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    /// Path under this run's directory holding the container's captured raw stdout, written
+    /// during cleanup before `docker rm`.
+    #[serde(default)]
+    pub stdout_path: String,
+    /// Path under this run's directory holding the container's captured raw stderr, written
+    /// during cleanup before `docker rm`.
+    #[serde(default)]
+    pub stderr_path: String,
+    /// Cost/usage recovered from the harness transcript, when available. Computed live from
+    /// `transcript_path`; never persisted to `state.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<HarnessUsage>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HarnessUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_cost: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -995,6 +1036,16 @@ fn docker_arguments(
             "--mount".to_owned(),
             format!("type=bind,source={},target=/pi-agent", agent.display()),
         ]);
+        let transcript_directory = run_directory.join("transcript");
+        validate_docker_path("Pi transcript path", &transcript_directory)?;
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target={}",
+                transcript_directory.display(),
+                PI_TRANSCRIPT_MOUNT
+            ),
+        ]);
     }
     for reference in &spec.credentials.environment {
         if std::env::var_os(reference).is_none() {
@@ -1011,10 +1062,23 @@ fn docker_arguments(
         ]);
     }
     let mut command = spec.harness.command.clone();
-    if let Some(model) = &spec.harness.model {
-        command.splice(1..1, ["--model".to_owned(), model.clone()]);
-    }
     command.extend(harness_args.iter().cloned());
+    if matches!(spec.harness.adapter, Adapter::Pi) {
+        // Gardr manages the pi transcript itself; a reusable `command` may still carry
+        // `--no-session` (e.g. today's example specs), so drop it rather than requiring specs
+        // to be rewritten.
+        command.retain(|argument| argument != "--no-session");
+    }
+    let mut injected = Vec::new();
+    if let Some(model) = &spec.harness.model {
+        injected.push("--model".to_owned());
+        injected.push(model.clone());
+    }
+    if matches!(spec.harness.adapter, Adapter::Pi) {
+        injected.push("--session".to_owned());
+        injected.push(format!("{PI_TRANSCRIPT_MOUNT}/session.jsonl"));
+    }
+    command.splice(1..1, injected);
     args.extend(command);
     Ok(args)
 }
@@ -1316,6 +1380,64 @@ fn image_id(reference: &str) -> Result<String> {
     }
     Ok(id)
 }
+fn capture_container_logs(container: &str, directory: &Path) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["logs", container])
+        .output()
+        .map_err(io_error)?;
+    if !output.status.success() {
+        if String::from_utf8_lossy(&output.stderr).contains("No such container") {
+            return Ok(());
+        }
+        return Err(command_error("docker logs", &output));
+    }
+    fs::write(directory.join("stdout.log"), &output.stdout).map_err(io_error)?;
+    fs::write(directory.join("stderr.log"), &output.stderr).map_err(io_error)
+}
+
+fn read_pi_transcript_usage(path: &Path) -> Option<HarnessUsage> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut usage = HarnessUsage::default();
+    let mut seen = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let usage_value = match entry.get("type").and_then(|value| value.as_str()) {
+            Some("message") => entry.get("message").and_then(|message| message.get("usage")),
+            Some("compaction") | Some("branch_summary") => entry.get("usage"),
+            _ => None,
+        };
+        if let Some(usage_value) = usage_value {
+            seen = true;
+            usage.input_tokens += usage_value
+                .get("input")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            usage.output_tokens += usage_value
+                .get("output")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            usage.cache_read_tokens += usage_value
+                .get("cacheRead")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            usage.cache_write_tokens += usage_value
+                .get("cacheWrite")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if let Some(cost) = usage_value.get("cost") {
+                usage.total_cost += cost.get("total").and_then(|value| value.as_f64()).unwrap_or(0.0);
+            }
+        }
+    }
+    seen.then_some(usage)
+}
+
 fn docker_status(container: &str) -> Result<Option<(bool, Option<i32>)>> {
     let output = Command::new("docker")
         .args([
@@ -1424,22 +1546,46 @@ fn validate_harness_args(arguments: &[String]) -> Result<()> {
 }
 fn validate_dispatch_harness_args(spec: &Spec, arguments: &[String]) -> Result<()> {
     if matches!(spec.harness.adapter, Adapter::Pi)
-        && arguments
-            .iter()
-            .any(|argument| is_pi_model_selection_argument(argument))
+        && arguments.iter().any(|argument| {
+            is_pi_model_selection_argument(argument) || is_pi_session_management_argument(argument)
+        })
     {
-        return Err("Pi dispatch arguments must not select a model or provider".to_owned());
+        return Err(
+            "Pi dispatch arguments must not select a model, provider, or session".to_owned(),
+        );
     }
     Ok(())
 }
 fn is_pi_reserved_argument(argument: &str) -> bool {
-    matches!(argument, "-p" | "--print" | "--") || is_pi_model_selection_argument(argument)
+    matches!(argument, "-p" | "--print" | "--")
+        || is_pi_model_selection_argument(argument)
+        || is_pi_session_management_argument(argument)
 }
 fn is_pi_model_selection_argument(argument: &str) -> bool {
     matches!(
         argument,
         "--model" | "--provider" | "--api-key" | "--thinking"
     ) || ["--model=", "--provider=", "--api-key=", "--thinking="]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix))
+}
+/// Session-management arguments Gardr must own for the pi adapter, since it manages the
+/// transcript itself. `--no-session` is deliberately excluded: existing specs may still declare
+/// it in `harness.command` and Gardr silently drops it rather than requiring a rewrite.
+fn is_pi_session_management_argument(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--session"
+            | "--session-id"
+            | "--session-dir"
+            | "--fork"
+            | "--continue"
+            | "-c"
+            | "--resume"
+            | "-r"
+            | "--name"
+            | "-n"
+    ) || ["--session=", "--session-id=", "--session-dir=", "--fork=", "--name="]
         .iter()
         .any(|prefix| argument.starts_with(prefix))
 }
@@ -1485,7 +1631,49 @@ fn validate_docker_path(label: &str, value: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Installs a fake `docker` executable at the front of `PATH` for the duration of the guard,
+    /// restoring the previous `PATH` on drop. Serialized via `PATH_LOCK` since `PATH` is
+    /// process-global.
+    struct FakeDocker {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        original_path: Option<std::ffi::OsString>,
+    }
+    impl FakeDocker {
+        fn install(script: &str, bin_dir: &Path) -> Self {
+            let guard = PATH_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            fs::create_dir_all(bin_dir).unwrap();
+            let docker = bin_dir.join("docker");
+            fs::write(&docker, script).unwrap();
+            set_executable(&docker).unwrap();
+            let original_path = std::env::var_os("PATH");
+            let mut new_path = bin_dir.as_os_str().to_owned();
+            if let Some(existing) = &original_path {
+                new_path.push(":");
+                new_path.push(existing);
+            }
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+            Self {
+                _guard: guard,
+                original_path,
+            }
+        }
+    }
+    impl Drop for FakeDocker {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_path {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
     fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gardr-test-{}-{}",
@@ -1724,6 +1912,95 @@ mod tests {
                 .any(|pair| pair == ["--model", "anthropic/claude-opus-4-6:high"])
         );
         assert!(arguments.ends_with(&["-p".to_owned(), "complete the assigned work".to_owned()]));
+        assert!(
+            !arguments.iter().any(|argument| argument == "--no-session"),
+            "Gardr must drop --no-session for the pi adapter so a transcript is written"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--session", "/gardr-transcript/session.jsonl"])
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.contains("target=/gardr-transcript"))
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn pi_dispatch_args_reject_session_management_flags() {
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(
+            validate_dispatch_harness_args(&spec, &["--session".to_owned(), "x".to_owned()])
+                .unwrap_err()
+                .contains("session")
+        );
+        assert!(validate_dispatch_harness_args(&spec, &["--continue".to_owned()]).is_err());
+        assert!(validate_dispatch_harness_args(&spec, &["-r".to_owned()]).is_err());
+        assert!(validate_dispatch_harness_args(&spec, &["--no-session".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn pi_command_reserves_session_management_flags() {
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--fork', 'x']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(
+            validate_spec(&spec)
+                .unwrap_err()
+                .contains("dispatch or model-selection")
+        );
+    }
+
+    #[test]
+    fn transcript_directory_is_created_for_pi_runs_and_recorded_in_state() {
+        let temp = temporary_directory();
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let store = Store::open(temp.join("store"));
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(workspace.join("dispatches")).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (record, _spec) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let transcript_path = record.transcript_path.clone().unwrap();
+        assert!(transcript_path.contains(&record.id));
+        assert!(Path::new(&transcript_path).parent().unwrap().is_dir());
+        assert!(record.stdout_path.ends_with("stdout.log"));
+        assert!(record.stderr_path.ends_with("stderr.log"));
+        let reloaded = store.read_run(&record.id).unwrap();
+        assert_eq!(reloaded.transcript_path, record.transcript_path);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn transcript_usage_is_summed_from_session_jsonl() {
+        let temp = temporary_directory();
+        let transcript = temp.join("session.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"s\"}\n",
+                "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":1,\"cacheWrite\":2,\"totalTokens\":18,\"cost\":{\"input\":0.01,\"output\":0.02,\"cacheRead\":0.0,\"cacheWrite\":0.0,\"total\":0.03}}}}\n",
+                "{\"type\":\"compaction\",\"id\":\"b\",\"parentId\":\"a\",\"summary\":\"s\",\"tokensBefore\":1,\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"total\":0.001}}}\n",
+            ),
+        )
+        .unwrap();
+        let usage = read_pi_transcript_usage(&transcript).unwrap();
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 6);
+        assert!((usage.total_cost - 0.031).abs() < 1e-9);
+        assert!(read_pi_transcript_usage(&temp.join("missing.jsonl")).is_none());
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -1772,6 +2049,106 @@ mod tests {
         let error = store.add_image("agent", &profile).unwrap_err();
         assert_eq!(error, CLAUDE_CODE_UNSUPPORTED);
         assert!(!store.image_path("agent").unwrap().exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cleanup_captures_stdout_and_stderr_before_docker_rm_and_stays_idempotent() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$1\" in\n  inspect) echo 'false 0' ;;\n  logs) echo \"logs $2\" >> '{order}'; printf 'OUT-CONTENT'; printf 'ERR-CONTENT' >&2 ;;\n  rm) echo \"rm $2\" >> '{order}' ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n",
+            order = order_file.display()
+        );
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let directory = store.run_path(&record.id).unwrap();
+        record.state = RunState::Running;
+        record.container = Some("fake-container".to_owned());
+        save_record(&directory, &record).unwrap();
+
+        store.cleanup(&record.id).unwrap();
+
+        assert!(directory.join("cleanup.complete").exists());
+        assert_eq!(
+            fs::read_to_string(directory.join("stdout.log")).unwrap(),
+            "OUT-CONTENT"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("stderr.log")).unwrap(),
+            "ERR-CONTENT"
+        );
+        let order = fs::read_to_string(&order_file).unwrap();
+        let logs_at = order.find("logs fake-container").expect("logs invoked");
+        let rm_at = order.find("rm fake-container").expect("rm invoked");
+        assert!(
+            logs_at < rm_at,
+            "docker logs must run before docker rm: {order}"
+        );
+
+        // Idempotent: cleanup again must not re-invoke docker (order file unchanged).
+        store.cleanup(&record.id).unwrap();
+        assert_eq!(fs::read_to_string(&order_file).unwrap(), order);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn observe_surfaces_cost_from_the_pi_transcript() {
+        let temp = temporary_directory();
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  inspect) echo 'true 0' ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n";
+        let _docker = FakeDocker::install(script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let directory = store.run_path(&record.id).unwrap();
+        record.state = RunState::Running;
+        record.container = Some("fake-container".to_owned());
+        save_record(&directory, &record).unwrap();
+        fs::write(
+            record.transcript_path.as_deref().unwrap(),
+            "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"total\":0.05}}}}\n",
+        )
+        .unwrap();
+
+        let observed = store.observe(&record.id).unwrap();
+        let usage = observed.usage.expect("usage should be surfaced");
+        assert!((usage.total_cost - 0.05).abs() < 1e-9);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
         fs::remove_dir_all(temp).unwrap();
     }
 
