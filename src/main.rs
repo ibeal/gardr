@@ -340,7 +340,8 @@ reusable `harness.command` so existing specs keep working unmodified. Regardless
 `cleanup` captures the container's raw stdout/stderr to `<root>/runs/<run-id>/stdout.log` and
 `stderr.log` before `docker rm`, whatever the harness's exit status. `run observe`'s JSON `usage`
 field reports token counts and total cost read live from the pi transcript, once one exists; there
-is no separate cost command.
+is no separate cost command. A `usage_error` field distinguishes a transcript that couldn't be read
+or parsed cleanly from `usage: null` (no spend yet).
 "#;
 
 fn root(

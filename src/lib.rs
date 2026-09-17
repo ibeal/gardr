@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,6 +210,7 @@ impl Store {
             stdout_path: directory.join("stdout.log").display().to_string(),
             stderr_path: directory.join("stderr.log").display().to_string(),
             usage: None,
+            usage_error: None,
         };
         write_new(&directory.join("spec.toml"), &content)?;
         if matches!(spec.harness.adapter, Adapter::Pi) {
@@ -312,10 +313,21 @@ impl Store {
                 }
             }
         }
-        record.usage = record
-            .transcript_path
-            .as_deref()
-            .and_then(|path| read_pi_transcript_usage(Path::new(path)));
+        record.usage = None;
+        record.usage_error = None;
+        if let Some(path) = record.transcript_path.as_deref() {
+            match read_pi_transcript_usage(Path::new(path)) {
+                Ok((usage, skipped)) => {
+                    record.usage = usage;
+                    if skipped > 0 {
+                        record.usage_error = Some(format!(
+                            "skipped {skipped} unparsable transcript line(s); totals may be incomplete"
+                        ));
+                    }
+                }
+                Err(error) => record.usage_error = Some(error),
+            }
+        }
         Ok(record)
     }
 
@@ -362,17 +374,37 @@ impl Store {
             return Ok(());
         }
         if let Some(container) = &record.container {
-            capture_container_logs(container, &directory)?;
+            let stdout_path = if record.stdout_path.is_empty() {
+                directory.join("stdout.log")
+            } else {
+                PathBuf::from(&record.stdout_path)
+            };
+            let stderr_path = if record.stderr_path.is_empty() {
+                directory.join("stderr.log")
+            } else {
+                PathBuf::from(&record.stderr_path)
+            };
+            // Best-effort: an ordinary `docker logs` failure (unreadable log driver, transient
+            // daemon hiccup, permissions) must not block `docker rm` or leave the run stuck
+            // short of a terminal cleaned state.
+            if let Err(error) = capture_container_logs(container, &stdout_path, &stderr_path) {
+                append_log(&directory, &format!("log capture failed: {error}"))?;
+            }
         }
         if let Some(container) = record.container {
             let output = Command::new("docker")
                 .args(["rm", &container])
                 .output()
                 .map_err(io_error)?;
-            if !output.status.success()
-                && !String::from_utf8_lossy(&output.stderr).contains("No such container")
-            {
-                return Err(command_error("docker rm", &output));
+            if !output.status.success() {
+                if String::from_utf8_lossy(&output.stderr).contains("No such container") {
+                    append_log(
+                        &directory,
+                        "docker rm: container already removed; capture files may be absent",
+                    )?;
+                } else {
+                    return Err(command_error("docker rm", &output));
+                }
             }
         }
         write_new(&directory.join("cleanup.complete"), b"cleaned\n")
@@ -594,6 +626,12 @@ pub struct RunRecord {
     /// `transcript_path`; never persisted to `state.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<HarnessUsage>,
+    /// Set when the transcript could not be read or parsed cleanly (permission denied, non-UTF8,
+    /// other IO failure, or unparsable lines beyond the tolerated in-progress trailing line).
+    /// Distinguishes "couldn't read/parse the transcript" from "no spend yet" (`usage: None`
+    /// with `usage_error: None`). Computed live; never persisted to `state.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HarnessUsage {
@@ -1380,32 +1418,64 @@ fn image_id(reference: &str) -> Result<String> {
     }
     Ok(id)
 }
-fn capture_container_logs(container: &str, directory: &Path) -> Result<()> {
-    let output = Command::new("docker")
+/// Captures a container's raw stdout/stderr via `docker logs`, streaming directly into the two
+/// destination files (rather than buffering the whole output in memory) so capture is incremental
+/// and doesn't risk OOM on a chatty run.
+fn capture_container_logs(container: &str, stdout_path: &Path, stderr_path: &Path) -> Result<()> {
+    let stdout_file = File::create(stdout_path).map_err(io_error)?;
+    let stderr_file = File::create(stderr_path).map_err(io_error)?;
+    let status = Command::new("docker")
         .args(["logs", container])
-        .output()
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
         .map_err(io_error)?;
-    if !output.status.success() {
-        if String::from_utf8_lossy(&output.stderr).contains("No such container") {
+    if !status.success() {
+        let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+        if stderr.contains("No such container") {
             return Ok(());
         }
-        return Err(command_error("docker logs", &output));
+        return Err(format!("docker logs failed: {}", stderr.trim()));
     }
-    fs::write(directory.join("stdout.log"), &output.stdout).map_err(io_error)?;
-    fs::write(directory.join("stderr.log"), &output.stderr).map_err(io_error)
+    Ok(())
 }
 
-fn read_pi_transcript_usage(path: &Path) -> Option<HarnessUsage> {
-    let content = fs::read_to_string(path).ok()?;
+/// Sums usage/cost entries from a pi session transcript. Returns `Ok((None, 0))` when the
+/// transcript doesn't exist yet (no spend to report) or exists but has no usage entries. Returns
+/// `Err` when the transcript exists but could not be read cleanly (permission denied, non-UTF8,
+/// other IO failure) so callers can tell "no spend yet" apart from "couldn't read the transcript".
+/// The final line is tolerated if unparsable (an in-progress transcript may have a torn trailing
+/// write); any other unparsable line is counted in the returned skipped-entry count rather than
+/// silently dropped, since a partial number shouldn't be presented as authoritative.
+fn read_pi_transcript_usage(path: &Path) -> Result<(Option<HarnessUsage>, u64)> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(error) => {
+            return Err(format!(
+                "could not read pi transcript {}: {error}",
+                path.display()
+            ));
+        }
+    };
     let mut usage = HarnessUsage::default();
     let mut seen = false;
-    for line in content.lines() {
+    let mut skipped = 0u64;
+    let lines: Vec<&str> = content.lines().collect();
+    let last_index = lines.len().saturating_sub(1);
+    for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
+        let entry = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(entry) => entry,
+            Err(_) => {
+                if index != last_index {
+                    skipped += 1;
+                }
+                continue;
+            }
         };
         let usage_value = match entry.get("type").and_then(|value| value.as_str()) {
             Some("message") => entry.get("message").and_then(|message| message.get("usage")),
@@ -1435,7 +1505,7 @@ fn read_pi_transcript_usage(path: &Path) -> Option<HarnessUsage> {
             }
         }
     }
-    seen.then_some(usage)
+    Ok((seen.then_some(usage), skipped))
 }
 
 fn docker_status(container: &str) -> Result<Option<(bool, Option<i32>)>> {
@@ -1572,6 +1642,10 @@ fn is_pi_model_selection_argument(argument: &str) -> bool {
 /// Session-management arguments Gardr must own for the pi adapter, since it manages the
 /// transcript itself. `--no-session` is deliberately excluded: existing specs may still declare
 /// it in `harness.command` and Gardr silently drops it rather than requiring a rewrite.
+///
+/// `--name`/`-n` (session display name) is deliberately excluded too: it sets a label on the
+/// session Gardr already selects via the injected `--session`, and does not conflict with it.
+/// Rejecting it would break specs that were valid before Gardr started injecting `--session`.
 fn is_pi_session_management_argument(argument: &str) -> bool {
     matches!(
         argument,
@@ -1583,9 +1657,7 @@ fn is_pi_session_management_argument(argument: &str) -> bool {
             | "-c"
             | "--resume"
             | "-r"
-            | "--name"
-            | "-n"
-    ) || ["--session=", "--session-id=", "--session-dir=", "--fork=", "--name="]
+    ) || ["--session=", "--session-id=", "--session-dir=", "--fork="]
         .iter()
         .any(|prefix| argument.starts_with(prefix))
 }
@@ -1943,6 +2015,16 @@ mod tests {
     }
 
     #[test]
+    fn pi_name_flag_does_not_conflict_with_the_injected_session_flag() {
+        // --name (session display name) doesn't conflict with Gardr's injected --session, so
+        // specs and dispatch args using it must keep validating (no migration required).
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--name', 'my-session']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        assert!(validate_spec(&spec).is_ok());
+        assert!(validate_dispatch_harness_args(&spec, &["--name".to_owned(), "x".to_owned()]).is_ok());
+        assert!(validate_dispatch_harness_args(&spec, &["-n".to_owned(), "x".to_owned()]).is_ok());
+    }
+
+    #[test]
     fn pi_command_reserves_session_management_flags() {
         let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--fork', 'x']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(
@@ -1996,11 +2078,62 @@ mod tests {
             ),
         )
         .unwrap();
-        let usage = read_pi_transcript_usage(&transcript).unwrap();
+        let (usage, skipped) = read_pi_transcript_usage(&transcript).unwrap();
+        let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 6);
         assert!((usage.total_cost - 0.031).abs() < 1e-9);
-        assert!(read_pi_transcript_usage(&temp.join("missing.jsonl")).is_none());
+        assert_eq!(skipped, 0);
+        let (missing_usage, missing_skipped) =
+            read_pi_transcript_usage(&temp.join("missing.jsonl")).unwrap();
+        assert!(missing_usage.is_none());
+        assert_eq!(missing_skipped, 0);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn transcript_usage_tolerates_a_torn_trailing_line_but_flags_other_unparsable_lines() {
+        let temp = temporary_directory();
+        let transcript = temp.join("session.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "not json at all\n",
+                "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input\":10,\"output\":5,\"cost\":{\"total\":0.05}}}}\n",
+                "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"con", // torn trailing write
+            ),
+        )
+        .unwrap();
+        let (usage, skipped) = read_pi_transcript_usage(&transcript).unwrap();
+        let usage = usage.expect("usage collected despite bad lines");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(
+            skipped, 1,
+            "the leading unparsable line is flagged; the torn trailing line is tolerated"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn transcript_usage_surfaces_io_errors_distinct_from_no_transcript_yet() {
+        let temp = temporary_directory();
+        // A directory in place of the transcript file yields a real IO error ("Is a directory")
+        // distinct from `NotFound`; this test runs as root, so permission bits alone wouldn't
+        // reliably block a read.
+        let transcript = temp.join("session.jsonl");
+        fs::create_dir(&transcript).unwrap();
+        let result = read_pi_transcript_usage(&transcript);
+        assert!(
+            result.is_err(),
+            "an unreadable transcript must surface an error, not be conflated with 'no spend yet'"
+        );
+        let (missing_usage, missing_skipped) =
+            read_pi_transcript_usage(&temp.join("missing.jsonl")).unwrap();
+        assert!(
+            missing_usage.is_none(),
+            "a missing transcript is 'no spend yet', not an error"
+        );
+        assert_eq!(missing_skipped, 0);
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -2107,6 +2240,58 @@ mod tests {
         // Idempotent: cleanup again must not re-invoke docker (order file unchanged).
         store.cleanup(&record.id).unwrap();
         assert_eq!(fs::read_to_string(&order_file).unwrap(), order);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_the_container_and_reaches_a_terminal_state_when_log_capture_fails() {
+        // An ordinary `docker logs` failure (unreadable log driver, transient daemon hiccup,
+        // permissions) must not leak the container: cleanup is best-effort about log capture and
+        // still proceeds to `docker rm` and `cleanup.complete`.
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$1\" in\n  inspect) echo 'false 0' ;;\n  logs) echo \"logs $2\" >> '{order}'; echo 'error during connect: transient daemon hiccup' >&2; exit 1 ;;\n  rm) echo \"rm $2\" >> '{order}' ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n",
+            order = order_file.display()
+        );
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let directory = store.run_path(&record.id).unwrap();
+        record.state = RunState::Running;
+        record.container = Some("fake-container".to_owned());
+        save_record(&directory, &record).unwrap();
+
+        store
+            .cleanup(&record.id)
+            .expect("cleanup must succeed and reach a terminal state despite log capture failure");
+
+        assert!(directory.join("cleanup.complete").exists());
+        let order = fs::read_to_string(&order_file).unwrap();
+        assert!(order.contains("logs fake-container"), "docker logs was attempted");
+        assert!(order.contains("rm fake-container"), "docker rm still ran despite log failure");
+        let runner_log = fs::read_to_string(directory.join("runner.log")).unwrap();
+        assert!(
+            runner_log.contains("log capture failed"),
+            "the log capture failure must be recorded: {runner_log}"
+        );
         fs::remove_dir_all(temp).unwrap();
     }
 
