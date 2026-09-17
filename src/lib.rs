@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -207,10 +207,6 @@ impl Store {
             harness_args,
         };
         write_new(&directory.join("spec.toml"), &content)?;
-        write_new(
-            &directory.join("workspace-seal.sha256"),
-            workspace_seal_digest(&workspace)?.as_bytes(),
-        )?;
         let mounts = lock_mounts(self, &spec)?;
         write_new(
             &directory.join("mounts.json"),
@@ -259,13 +255,6 @@ impl Store {
             return Err("cleaned runs are terminal and cannot be resumed".to_owned());
         }
         let workspace = validate_workspace(Path::new(&record.workspace))?;
-        let recorded_seal =
-            fs::read_to_string(directory.join("workspace-seal.sha256")).map_err(io_error)?;
-        if recorded_seal != workspace_seal_digest(&workspace)? {
-            return Err(
-                "workspace sealed dispatch inventory changed since the run was created".to_owned(),
-            );
-        }
         let frozen = fs::read(directory.join("spec.toml")).map_err(io_error)?;
         if digest(&frozen) != record.spec.sha256 {
             return Err("frozen run spec does not match recorded spec identity".to_owned());
@@ -888,123 +877,7 @@ pub fn validate_workspace(path: &Path) -> Result<PathBuf> {
     if !workspace.is_dir() {
         return Err("workspace must be a directory".to_owned());
     }
-    let dispatches = workspace.join("dispatches");
-    if !dispatches.is_dir() {
-        return Err("workspace is missing dispatches/".to_owned());
-    }
-    let mut sealed = false;
-    for entry in fs::read_dir(&dispatches).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        if !entry.file_type().map_err(io_error)?.is_dir() {
-            return Err("workspace dispatches contains a non-directory entry".to_owned());
-        }
-        let dispatch = entry.path();
-        let record = dispatch.join("dispatch.json");
-        if !record.is_file() {
-            return Err(format!(
-                "workspace dispatch is not sealed: {}",
-                dispatch.display()
-            ));
-        }
-        sealed = true;
-        verify_dispatch(&dispatch, &record)?;
-    }
-    if !sealed {
-        return Err("workspace has no sealed dispatch inventory".to_owned());
-    }
     Ok(workspace)
-}
-fn workspace_seal_digest(workspace: &Path) -> Result<String> {
-    let mut seals = Vec::new();
-    for entry in fs::read_dir(workspace.join("dispatches")).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        if entry.file_type().map_err(io_error)?.is_dir() {
-            let path = entry.path().join("dispatch.json");
-            seals.push((
-                entry.file_name().to_string_lossy().into_owned(),
-                fs::read(path).map_err(io_error)?,
-            ));
-        }
-    }
-    seals.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hash = Sha256::new();
-    for (name, content) in seals {
-        hash.update(name.as_bytes());
-        hash.update([0]);
-        hash.update(content);
-        hash.update([0]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
-fn verify_dispatch(directory: &Path, record: &Path) -> Result<()> {
-    #[derive(Deserialize)]
-    struct Inventory {
-        version: u32,
-        files: Vec<InventoryEntry>,
-    }
-    #[derive(Deserialize)]
-    struct InventoryEntry {
-        path: String,
-        sha256: String,
-    }
-    let inventory: Inventory = serde_json::from_slice(&fs::read(record).map_err(io_error)?)
-        .map_err(|error| format!("invalid sealed dispatch inventory: {error}"))?;
-    if inventory.version != 1 {
-        return Err("unsupported sealed dispatch inventory version".to_owned());
-    }
-    let mut expected = BTreeSet::new();
-    for item in inventory.files {
-        let relative = validate_relative_path(Path::new(&item.path))?;
-        if !expected.insert((relative, item.sha256)) {
-            return Err("sealed dispatch contains duplicate inventory paths".to_owned());
-        }
-    }
-    let actual = inventory_files(directory)?;
-    if expected != actual {
-        return Err(format!(
-            "sealed dispatch inventory does not match: {}",
-            directory.display()
-        ));
-    }
-    if !directory.join("HANDOFF.json").is_file() {
-        return Err("sealed dispatch is missing HANDOFF.json".to_owned());
-    }
-    Ok(())
-}
-
-fn inventory_files(base: &Path) -> Result<BTreeSet<(PathBuf, String)>> {
-    let mut result = BTreeSet::new();
-    collect_inventory(base, base, &mut result)?;
-    Ok(result)
-}
-fn collect_inventory(
-    base: &Path,
-    directory: &Path,
-    result: &mut BTreeSet<(PathBuf, String)>,
-) -> Result<()> {
-    for entry in fs::read_dir(directory).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        let kind = entry.file_type().map_err(io_error)?;
-        if kind.is_dir() {
-            collect_inventory(base, &path, result)?;
-        } else if kind.is_file() {
-            let relative = path
-                .strip_prefix(base)
-                .map_err(|error| error.to_string())?
-                .to_path_buf();
-            if relative != Path::new("dispatch.json") && relative != Path::new("HANDOFF.json") {
-                result.insert((relative, digest(&fs::read(path).map_err(io_error)?)));
-            }
-        } else {
-            return Err(format!(
-                "sealed dispatch contains unsupported entry: {}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
@@ -1608,19 +1481,6 @@ fn validate_docker_path(label: &str, value: &Path) -> Result<()> {
         Ok(())
     }
 }
-fn validate_relative_path(path: &Path) -> Result<PathBuf> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        Err(format!("invalid relative path: {}", path.display()))
-    } else {
-        Ok(path.to_path_buf())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1696,28 +1556,22 @@ mod tests {
     }
 
     #[test]
-    fn workspace_validation_detects_changed_sealed_input() {
+    fn workspace_validation_accepts_arbitrary_directory_contents() {
         let temp = temporary_directory();
         let workspace = temp.join("workspace");
-        let dispatch = workspace.join("dispatches/build");
-        fs::create_dir_all(&dispatch).unwrap();
-        fs::write(dispatch.join("AGENTS.md"), b"instructions").unwrap();
-        fs::write(dispatch.join("HANDOFF.json"), b"{}\n").unwrap();
-        let hash = digest(b"instructions");
-        fs::write(
-            dispatch.join("dispatch.json"),
-            format!(
-                "{{\"version\":1,\"files\":[{{\"path\":\"AGENTS.md\",\"sha256\":\"{hash}\"}}]}}"
-            ),
-        )
-        .unwrap();
-        validate_workspace(&workspace).unwrap();
-        fs::write(dispatch.join("AGENTS.md"), b"changed").unwrap();
-        assert!(
-            validate_workspace(&workspace)
-                .unwrap_err()
-                .contains("does not match")
-        );
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("arbitrary-input"), b"content").unwrap();
+        assert!(validate_workspace(&workspace).unwrap().is_dir());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn workspace_validation_rejects_non_directories() {
+        let temp = temporary_directory();
+        let file = temp.join("workspace");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(validate_workspace(&file).unwrap_err().contains("directory"));
+        assert!(validate_workspace(&temp.join("missing")).is_err());
         fs::remove_dir_all(temp).unwrap();
     }
     #[test]
@@ -1726,19 +1580,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workspace_mount_aliases_and_unsealed_dispatches() {
+    fn rejects_workspace_mount_aliases() {
         let spec = parse_spec(b"version=1\n[image]\nname='example'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='pi'\ncommand=['pi']\nmodel='anthropic/claude-opus-4-6'\n[[mounts]]\nname='tools'\ntarget='/workspace/.'\n").unwrap();
         assert!(validate_spec(&spec).is_err());
-
-        let temp = temporary_directory();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(workspace.join("dispatches/unsealed")).unwrap();
-        assert!(
-            validate_workspace(&workspace)
-                .unwrap_err()
-                .contains("not sealed")
-        );
-        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
