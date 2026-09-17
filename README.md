@@ -68,6 +68,16 @@ run writes immutable `spec.toml` and `resolved.json`, then mutable `state.json` 
 under the configured root's `runs/<run-id>/`. Resume validates the sealed workspace and uses the frozen spec;
 it never silently replaces state. Cleanup is idempotent and refuses a running run.
 
+For `adapter = "pi"`, Gardr always persists pi's session transcript under
+`runs/<run-id>/transcript/session.jsonl`, even if a spec's reusable `harness.command` still
+contains `--no-session`: Gardr drops that flag and injects `--session` itself so the transcript
+survives cleanup. Regardless of adapter, `run cleanup` captures the container's raw stdout/stderr to
+`runs/<run-id>/stdout.log` and `runs/<run-id>/stderr.log` before `docker rm`, whatever the harness's
+exit status. `run observe`'s JSON includes a `usage` field with token counts and total cost read live
+from the pi transcript once one exists, so a caller never needs to locate or parse the session file
+itself; there is no separate cost-reporting command. If the transcript exists but couldn't be read
+or parsed cleanly, `usage_error` explains why, distinct from a plain `usage: null` (no spend yet).
+
 Image profiles are immutable, host-owned runtime policy. A profile chooses exactly one source: an image reference or an approved build context at `<root>/images/<context>/Dockerfile`; it lists the harness adapters and preinstalled tools it provides. Specs select profiles by name and may declare `tools.required` capabilities that the profile must provide. Gardr resolves the profile and records its identity and Docker image ID in the run metadata. It does not select an image from imperative `tools.install` commands or use a remote image registry.
 
 ```toml
