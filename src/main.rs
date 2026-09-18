@@ -1,5 +1,7 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use gardr::{Store, validate_workspace};
@@ -37,7 +39,11 @@ fn run() -> Result<(), String> {
             print!("{RUN_HELP}");
             Ok(())
         }
-        command @ ("spec" | "image" | "run") => {
+        "credential" if subcommand_help(&args) => {
+            print!("{CREDENTIAL_HELP}");
+            Ok(())
+        }
+        command @ ("spec" | "image" | "run" | "credential") => {
             let root = root(
                 command_line_root,
                 env::var_os("GARDR_ROOT").map(PathBuf::from),
@@ -48,6 +54,7 @@ fn run() -> Result<(), String> {
                 "spec" => spec(&store, args),
                 "image" => image(&store, args),
                 "run" => run_command(&store, args),
+                "credential" => credential(&store, args),
                 _ => unreachable!(),
             }
         }
@@ -127,6 +134,44 @@ fn image(store: &Store, mut args: Vec<String>) -> Result<(), String> {
     }
 }
 
+fn credential(store: &Store, mut args: Vec<String>) -> Result<(), String> {
+    match take(&mut args)?.as_str() {
+        "set" => {
+            let name = take(&mut args)?;
+            let file = option(&mut args, "--file");
+            let stdin = flag(&mut args, "--stdin");
+            reject_extra(&args)?;
+            let value = match (file, stdin) {
+                (Some(_), true) => {
+                    return Err("--file and --stdin are mutually exclusive".to_owned());
+                }
+                (Some(path), false) => fs::read(&path).map_err(|error| error.to_string())?,
+                (None, true) => {
+                    let mut buffer = Vec::new();
+                    io::stdin()
+                        .read_to_end(&mut buffer)
+                        .map_err(|error| error.to_string())?;
+                    buffer
+                }
+                (None, false) => return Err("one of --file or --stdin is required".to_owned()),
+            };
+            store.set_credential(&name, &value)?;
+            print_json(&serde_json::json!({"name": name, "registered": true}))
+        }
+        "list" => {
+            reject_extra(&args)?;
+            print_json(&store.list_credentials()?)
+        }
+        "rm" => {
+            let name = take(&mut args)?;
+            reject_extra(&args)?;
+            store.remove_credential(&name)?;
+            print_json(&serde_json::json!({"name": name, "removed": true}))
+        }
+        _ => Err(usage()),
+    }
+}
+
 fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
     match take(&mut args)?.as_str() {
         "start" => {
@@ -185,6 +230,14 @@ fn options(args: &mut Vec<String>, flag: &str) -> Vec<String> {
     }
     values
 }
+fn flag(args: &mut Vec<String>, name: &str) -> bool {
+    if let Some(index) = args.iter().position(|value| value == name) {
+        args.remove(index);
+        true
+    } else {
+        false
+    }
+}
 fn take(args: &mut Vec<String>) -> Result<String, String> {
     if args.is_empty() {
         Err(usage())
@@ -213,13 +266,15 @@ fn usage() -> String {
     HELP.trim_end().to_owned()
 }
 
-const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image Manage named image profiles\n  spec  Manage sandbox specifications\n  run   Manage workspace runs\n  docs  Print built-in guidance and examples\n  help  Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nRun `gardr spec --help` or `gardr run --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
+const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  spec       Manage sandbox specifications\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nCredential commands:\n  set, list, rm\n\nRun `gardr spec --help`, `gardr run --help`, or `gardr credential --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
 
-const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the specification format.\n";
+const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nA spec's [credentials] environment entries resolve from the `gardr credential` store, not from\ngardr's own process environment; see `gardr credential --help` and `gardr docs`.\n\nUse `gardr docs` for the specification format.\n";
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
 const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name> [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
+
+const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   Register (upsert) a credential: gardr credential set <name> --file <path> | --stdin\n  list  Print registered credential names as JSON (values are never included)\n  rm    Remove a registered credential: <name>\n\nCredential values are never printed back by any command. Use `gardr docs` for how a spec's\n[credentials] environment entries resolve a value through this store.\n";
 
 const DOCS: &str = r#"# gardr — durable sandbox execution
 
@@ -252,6 +307,11 @@ gardr run observe <run-id>               # reconcile and return current run stat
 gardr run resume <run-id>                # restart a stopped or failed run
 gardr run stop <run-id>                  # stop a running container
 gardr run cleanup <run-id>               # remove a non-running container; idempotent
+
+gardr credential set <name> --file <path>   # register (upsert) a credential from a file
+gardr credential set <name> --stdin         # or from stdin; the value is never printed back
+gardr credential list                       # JSON list of registered credential names (no values)
+gardr credential rm <name>                  # remove a registered credential
 ```
 
 All command results except `spec show` are one JSON document, intended for an orchestrator to read.
@@ -279,7 +339,10 @@ target = "/tools"
 read_only = true
 
 [credentials]
-environment = ["GH_TOKEN"]     # names only; values are never stored
+# Plain strings stay valid: the env-var name doubles as the credential-store key.
+# A table form maps the in-container `name` to a different registry key `from`
+# (defaulting to `name`), so one registered secret can be reused under several names.
+environment = ["GH_TOKEN", { name = "GH_TOKEN", from = "github-read-only-pat" }]
 
 [firewall]
 allow = ["packages.example.com"]
@@ -306,7 +369,18 @@ Specs select profiles by name. `tools.required` must be provided by that profile
 remains for ephemeral missing-tool installation and never selects an image. Profile, spec, mount, and
 build-context names select approved children of the Gardr root. A mount cannot target `/workspace`,
 and Gardr rejects unknown fields, duplicate mount names or targets, invalid container paths, and
-credential values.
+duplicate credential environment names.
+
+Gardr owns a private credential registry under `<root>/credentials/`, independent of
+`mounts`/`specs`/`images`: `gardr credential set <name> --file <path>` (or `--stdin`) registers or
+rotates a value without ever printing it back, `gardr credential list` prints registered names as
+JSON, and `gardr credential rm <name>` removes one. A spec's `[credentials] environment` entries stay
+valid as plain strings, which resolve from the store entry of the same name; an entry may instead be
+a table with `name` (the in-container env var) and `from` (the store key, defaulting to `name`), so
+one registered secret can be injected under different names across specs or entries. `run start`
+resolves each entry's value from this store — never from `gardr`'s own process environment — and
+fails with a clear error naming the missing store key if a spec references an unregistered
+credential. Two entries that resolve to the same in-container `name` are rejected at `spec add` time.
 
 `claude-code` is a recognized `harness.adapter` value but is not a supported harness today: it has
 no credential-bootstrap mechanism, so `gardr spec add` and `gardr image add` both reject it at store
@@ -387,7 +461,7 @@ mod tests {
     #[test]
     fn help_documents_the_default_root_and_docs_command() {
         assert!(HELP.contains("~/.gardr by default"));
-        assert!(HELP.contains("docs  Print built-in guidance"));
+        assert!(HELP.contains("docs       Print built-in guidance"));
     }
 
     #[test]
@@ -412,5 +486,71 @@ mod tests {
         assert!(!subcommand_help(&["list".to_owned()]));
         assert!(SPEC_HELP.contains("add"));
         assert!(RUN_HELP.contains("validate-workspace"));
+        assert!(CREDENTIAL_HELP.contains("set"));
+    }
+
+    #[test]
+    fn flag_removes_a_boolean_switch_when_present() {
+        let mut args = vec!["--stdin".to_owned(), "extra".to_owned()];
+        assert!(flag(&mut args, "--stdin"));
+        assert_eq!(args, ["extra"]);
+        assert!(!flag(&mut args, "--stdin"));
+    }
+
+    #[test]
+    fn credential_set_registers_from_a_file_without_printing_the_value() {
+        let temp = std::env::temp_dir().join(format!(
+            "gardr-main-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let store = gardr::Store::open(temp.join("store"));
+        let source = temp.join("secret.txt");
+        std::fs::write(&source, b"super-secret").unwrap();
+        credential(
+            &store,
+            vec![
+                "set".to_owned(),
+                "gh-pat".to_owned(),
+                "--file".to_owned(),
+                source.display().to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(store.credential_path("gh-pat").unwrap()).unwrap(),
+            b"super-secret"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn credential_set_rejects_file_and_stdin_together() {
+        let temp = std::env::temp_dir().join(format!(
+            "gardr-main-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                + 1
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let store = gardr::Store::open(temp.join("store"));
+        let error = credential(
+            &store,
+            vec![
+                "set".to_owned(),
+                "gh-pat".to_owned(),
+                "--file".to_owned(),
+                "whatever".to_owned(),
+                "--stdin".to_owned(),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("mutually exclusive"));
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }
