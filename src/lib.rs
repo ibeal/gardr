@@ -182,11 +182,10 @@ impl Store {
     /// Registers (sets/upserts) a credential value under the private store. The value is never
     /// echoed back by any command.
     pub fn set_credential(&self, name: &str, value: &[u8]) -> Result<()> {
+        validate_credential_value(value)?;
         let path = self.credential_path(name)?;
-        fs::create_dir_all(self.credentials_path()).map_err(io_error)?;
-        set_private_directory(&self.credentials_path())?;
-        atomic_write(&path, value)?;
-        set_private_file(&path)
+        create_private_dir_all(&self.credentials_path())?;
+        atomic_write(&path, value)
     }
 
     /// Lists registered credential names. Values are never included.
@@ -454,6 +453,7 @@ impl Store {
                 }
             }
         }
+        remove_credentials_env(&directory);
         write_new(&directory.join("cleanup.complete"), b"cleaned\n")
     }
 
@@ -491,8 +491,14 @@ impl Store {
         };
         let output = match Command::new("docker").args(&arguments).output() {
             Ok(output) => output,
-            Err(error) => return fail_run(&directory, &mut record, io_error(error)),
+            Err(error) => {
+                remove_credentials_env(&directory);
+                return fail_run(&directory, &mut record, io_error(error));
+            }
         };
+        // Docker only reads `--env-file` at this invocation, not afterward; the plaintext
+        // resolved-secrets file has no further purpose and shouldn't outlive the run in cleartext.
+        remove_credentials_env(&directory);
         if !output.status.success() {
             return fail_run(
                 &directory,
@@ -514,6 +520,20 @@ impl Store {
         append_log(&directory, "container launched")?;
         save_record(&directory, &record)?;
         Ok(record)
+    }
+}
+
+/// Best-effort removal of the run's plaintext resolved-credentials env-file. Missing is not an
+/// error (e.g. the spec has no credentials, or cleanup already removed it).
+fn remove_credentials_env(directory: &Path) {
+    let path = directory.join("credentials.env");
+    if let Err(error) = fs::remove_file(&path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        let _ = append_log(
+            directory,
+            &format!("failed to remove {}: {error}", path.display()),
+        );
     }
 }
 
@@ -1194,7 +1214,6 @@ fn docker_arguments(
         }
         let env_file = run_directory.join("credentials.env");
         atomic_write(&env_file, lines.as_bytes())?;
-        set_private_file(&env_file)?;
         args.extend(["--env-file".to_owned(), env_file.display().to_string()]);
     }
     args.push(image.to_owned());
@@ -1399,6 +1418,22 @@ fn set_private_directory(path: &Path) -> Result<()> {
 fn set_private_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
+/// Creates `path` (and any missing parents) with mode 0700 set from the `mkdir` call itself,
+/// rather than a normal `create_dir_all` followed by a later `chmod`, so a directory that will
+/// hold secret material is never briefly world/group-accessible at the umask default.
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(io_error)
+}
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(io_error)
+}
 #[cfg(unix)]
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1439,9 +1474,41 @@ fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents).map_err(io_error)
 }
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let temporary = path.with_extension("new");
-    fs::write(&temporary, contents).map_err(io_error)?;
+    // Append (not replace) a suffix that includes the current process ID: `validate_name` allows
+    // `.` in stored names (e.g. a credential named `a.b`), so `path.with_extension("new")` could
+    // silently collide with and clobber an unrelated sibling entry (e.g. `a`). Appending to the
+    // full file name instead keeps the temp path derived from, but distinct from, every valid
+    // stored name.
+    let mut temporary_name = path
+        .file_name()
+        .expect("atomic_write path has a file name")
+        .to_os_string();
+    temporary_name.push(format!(".tmp-{}", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    write_private(&temporary, contents)?;
     fs::rename(temporary, path).map_err(io_error)
+}
+/// Writes `contents` to a newly created `path` with mode 0600 set by the `open` call itself
+/// (rather than a normal write followed by a later `chmod`), so files that may hold secret
+/// material (credentials, the run's resolved `credentials.env`) are never briefly readable at the
+/// umask default. `atomic_write`'s callers that don't hold secrets (spec/run state, etc.) are
+/// unaffected in practice other than also becoming private, which is harmless.
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_error)?;
+    file.write_all(contents).map_err(io_error)
+}
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents).map_err(io_error)
 }
 fn approved_child(root: &Path, name: &str) -> Result<PathBuf> {
     let root = root
@@ -1677,6 +1744,31 @@ fn command_error(name: &str, output: &std::process::Output) -> String {
 }
 fn io_error(error: io::Error) -> String {
     error.to_string()
+}
+/// Rejects credential values that would be unsafe to write verbatim into an `--env-file`'s
+/// `NAME=value` line: Docker splits `--env-file` on newlines and treats a leading `#` as a
+/// comment, with no quoting support, so an embedded newline (e.g. a pasted PEM/SSH key) would
+/// inject additional, attacker/user-uncontrolled env assignments into the container and truncate
+/// the real secret. A single trailing newline (common from files written by editors) is tolerated
+/// since it is stripped before the value is written to the env file.
+fn validate_credential_value(value: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(value)
+        .map_err(|error| format!("credential value is not UTF-8: {error}"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.contains('\n') {
+        return Err(
+            "credential value must be a single line: multi-line values (e.g. a pasted PEM/SSH \
+             key) cannot be safely stored in an env-file"
+                .to_owned(),
+        );
+    }
+    if text.starts_with('#') {
+        return Err(
+            "credential value must not begin with '#': env-files treat a leading '#' as a comment"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 fn validate_name(label: &str, value: &str) -> Result<()> {
     if value.is_empty()
@@ -2599,6 +2691,136 @@ mod tests {
         assert!(
             error.contains("required credential is not registered: GH_TOKEN"),
             "{error}"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn credential_set_rejects_multi_line_and_comment_looking_values() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let error = store
+            .set_credential(
+                "ssh-key",
+                b"-----BEGIN KEY-----\nsecret-bytes\n-----END KEY-----\n",
+            )
+            .unwrap_err();
+        assert!(error.contains("single line"), "{error}");
+        assert!(!store.credential_path("ssh-key").unwrap().exists());
+
+        let error = store
+            .set_credential("comment", b"#not-a-comment")
+            .unwrap_err();
+        assert!(error.contains('#'), "{error}");
+
+        // A single trailing newline (a common artifact of files written by editors) is tolerated.
+        store.set_credential("token", b"plain-value\n").unwrap();
+        assert_eq!(
+            fs::read(store.credential_path("token").unwrap()).unwrap(),
+            b"plain-value\n"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_does_not_clobber_a_sibling_credential_whose_name_is_a_prefix() {
+        // `validate_name` allows `.` in a credential name; registering `a.b` must not go through a
+        // temp path (like the old `<name>.new`) that collides with a distinct, already-registered
+        // credential `a`.
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        store.set_credential("a", b"a-secret").unwrap();
+        store.set_credential("a.b", b"a-b-secret").unwrap();
+        assert_eq!(
+            fs::read(store.credential_path("a").unwrap()).unwrap(),
+            b"a-secret",
+            "registering a.b must not clobber the unrelated credential a"
+        );
+        assert_eq!(
+            fs::read(store.credential_path("a.b").unwrap()).unwrap(),
+            b"a-b-secret"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn credentials_env_does_not_survive_cleanup() {
+        let temp = temporary_directory();
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  inspect) echo 'false 0' ;;\n  logs) exit 0 ;;\n  rm) exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n";
+        let _docker = FakeDocker::install(script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let directory = store.run_path(&record.id).unwrap();
+        // Simulate a run that resolved credentials into the plaintext env-file, as `launch` would
+        // before invoking `docker run` (independent of exercising the credential-resolution path).
+        let credentials_env = directory.join("credentials.env");
+        atomic_write(&credentials_env, b"GH_TOKEN=super-secret\n").unwrap();
+        assert!(credentials_env.exists());
+        record.state = RunState::Stopped;
+        record.container = Some("fake-container".to_owned());
+        save_record(&directory, &record).unwrap();
+
+        store.cleanup(&record.id).unwrap();
+
+        assert!(
+            !credentials_env.exists(),
+            "cleanup must remove the plaintext resolved-credentials env-file"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn launch_removes_credentials_env_after_docker_run_returns() {
+        let temp = temporary_directory();
+        let script = "#!/bin/sh\nset -eu\nif [ \"$1\" = 'image' ] && [ \"$2\" = 'inspect' ]; then\n  if [ \"$3\" = '--format' ]; then\n    echo 'sha256:fakeid'\n  fi\n  exit 0\nfi\nif [ \"$1\" = 'run' ]; then\n  echo 'fake-container'\n  exit 0\nfi\necho \"unexpected docker command: $*\" >&2\nexit 1\n";
+        let _docker = FakeDocker::install(script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(
+            &source,
+            b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[credentials]\nenvironment = ['GH_TOKEN']\n",
+        )
+        .unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        store.set_credential("GH_TOKEN", b"super-secret").unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+
+        let record = store.start(&workspace, "build", vec![]).unwrap();
+        assert!(matches!(record.state, RunState::Running));
+        let directory = store.run_path(&record.id).unwrap();
+        assert!(
+            !directory.join("credentials.env").exists(),
+            "credentials.env must not survive past docker run returning"
         );
         fs::remove_dir_all(temp).unwrap();
     }

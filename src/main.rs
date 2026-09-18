@@ -342,7 +342,7 @@ read_only = true
 # Plain strings stay valid: the env-var name doubles as the credential-store key.
 # A table form maps the in-container `name` to a different registry key `from`
 # (defaulting to `name`), so one registered secret can be reused under several names.
-environment = ["GH_TOKEN", { name = "GH_TOKEN", from = "github-read-only-pat" }]
+environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat" }]
 
 [firewall]
 allow = ["packages.example.com"]
