@@ -35,7 +35,10 @@ target = "/tools"
 read_only = true
 
 [credentials]
-environment = ["GH_TOKEN"]     # references only; values are never stored
+# Plain strings stay valid: the env-var name doubles as the credential-store key. A table form
+# maps the in-container `name` to a different registry key `from` (defaulting to `name`), so one
+# registered secret can be reused under several names.
+environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat" }]
 
 # Bridge runs start with Gardr's minimum egress policy plus these domains.
 [firewall]
@@ -60,6 +63,10 @@ gardr run start --workspace /workspaces/task --spec build --harness-arg -p --har
 gardr run observe run-…
 gardr run stop run-…
 gardr run cleanup run-…
+
+gardr credential set github-read-only-pat --file ./pat.txt   # or `--stdin`; never printed back
+gardr credential list                                        # JSON list of registered names
+gardr credential rm github-read-only-pat
 ```
 
 All command results except `spec show` are single JSON documents for orchestration. `run observe`
@@ -89,9 +96,22 @@ tools = ["git", "node"]
 reference = "ghcr.io/example/pi-agent@sha256:..."
 ```
 
+Gardr owns a private credential registry under `<root>/credentials/`, independent of
+`mounts`/`specs`/`images`, with private (0700/0600) permissions. `gardr credential set <name>
+--file <path>` (or `--stdin`) registers or rotates a value without ever printing it back; `gardr
+credential list` prints registered names as JSON (values are never included); `gardr credential rm
+<name>` removes one. A spec's `[credentials] environment` entries stay valid as plain strings,
+which resolve from the store entry of the same name, or may instead be a table with `name` (the
+in-container env var) and `from` (the store key, defaulting to `name`), letting one registered
+secret be injected under different names across specs or entries. `run start` resolves each entry's
+value from this store — never from `gardr`'s own process environment — and fails with a clear error
+naming the missing store key if a spec references an unregistered credential. Two entries that
+resolve to the same in-container `name` are rejected at `spec add` time.
+
 The initial backend is Docker. Gardr runs the workspace at `/workspace`, selected approved mounts
-at their declared targets, the declared Docker network policy, and only referenced credential
-environment variables. Docker Desktop provides the macOS path; native Docker is supported on Linux.
+at their declared targets, the declared Docker network policy, and credential environment
+variables resolved through the registry. Docker Desktop provides the macOS path; native Docker is
+supported on Linux.
 No native macOS process sandbox or non-Docker Linux backend is implemented in this initial release.
 
 | Host | Backend | Supported | Notes |
