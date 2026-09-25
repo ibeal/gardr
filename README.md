@@ -163,8 +163,11 @@ further action. Docker tags Gardr previously created for a rebuilt build-context
 longer match its current context directory are removed on a best-effort basis: removal failure
 (e.g. a stopped run's container still referencing the stale tag) is reported on the result's
 `stale_removal_error` rather than failing the rebuild, since the image was already rebuilt
-successfully by that point. Images Gardr did not create are never touched. A rebuild failure (the
-build or pull itself) reports the docker error and leaves the previously working image in place.
+successfully by that point. Images Gardr did not create are never touched, and the label Gardr
+uses to recognize a profile's own tags is scoped to the store's root, so two independent
+`--root`/`GARDR_ROOT` roots with a same-named profile never see or remove each other's images. A
+rebuild failure (the build or pull itself) reports the docker error and leaves the previously
+working image in place.
 Refresh is always explicit: there is no remote registry, automatic staleness detection, or
 scheduled rebuild.
 

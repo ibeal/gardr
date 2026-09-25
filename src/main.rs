@@ -452,8 +452,10 @@ further action. Docker tags Gardr previously created for a rebuilt build-context
 longer correspond to its current context directory are removed on a best-effort basis: since the
 image is already rebuilt by that point, a removal failure (e.g. a stopped run's container still
 referencing the stale tag) is reported on the result's `stale_removal_error` rather than failing
-the rebuild. Images Gardr did not create are never touched. A rebuild failure (the build or pull
-itself) reports the docker error and leaves the previously working image and tag in place.
+the rebuild. Images Gardr did not create are never touched, and the label used to recognize a
+profile's own tags is scoped to this store's root, so two independent `--root`/`GARDR_ROOT` roots
+with a same-named profile never see or remove each other's images. A rebuild failure (the build or
+pull itself) reports the docker error and leaves the previously working image and tag in place.
 Rebuilding is always explicit — there is no automatic staleness detection or scheduled refresh.
 
 An image profile is host-owned policy and declares a single source, its supported harnesses, and the

@@ -52,6 +52,20 @@ impl Store {
             Err(error) => Err(io_error(error)),
         }
     }
+    /// A stable identifier for this store's root, used to scope the Docker labels Gardr attaches
+    /// to images it builds. Two independent `--root`/`GARDR_ROOT` roots on the same Docker daemon
+    /// can otherwise have same-named image profiles whose build-context digests coincidentally
+    /// differ; without this, a rebuild in one root could find and remove the other root's
+    /// currently-in-use image tag through a bare `gardr.image=<name>` label match. Canonicalizing
+    /// keeps two references to the same root consistent; if the root does not exist yet, the raw
+    /// path is used instead so the identifier is still stable for this process's lifetime.
+    fn root_identity(&self) -> String {
+        let path = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        digest(path.display().to_string().as_bytes())[..16].to_owned()
+    }
     pub fn pi_agent_path(&self) -> PathBuf {
         self.root.join("pi").join("agent")
     }
@@ -158,11 +172,12 @@ impl Store {
         if let Some(context) = &profile.source.build_context {
             let context_path = approved_child(&self.images_path(), context)?;
             let tag = format!("gardr-{}", digest_directory(&context_path)?);
+            let root_id = self.root_identity();
             let build = Command::new("docker")
                 .arg("build")
                 .args(["--no-cache", "--pull"])
                 .args(["--tag", &tag])
-                .args(["--label", &gardr_image_label(name)])
+                .args(["--label", &gardr_image_label(&root_id, name)])
                 .arg(&context_path)
                 .output()
                 .map_err(io_error)?;
@@ -175,7 +190,7 @@ impl Store {
             // run's container still references it, which is normal until `gardr run cleanup`)
             // must not be reported as the rebuild itself failing. Surface it on the result
             // instead of propagating it as this call's Err.
-            let stale_removal_error = remove_stale_build_tags(name, &tag).err();
+            let stale_removal_error = remove_stale_build_tags(&root_id, name, &tag).err();
             Ok(ImageRebuildResult {
                 name: name.to_owned(),
                 image,
@@ -1620,7 +1635,10 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
             let build = Command::new("docker")
                 .arg("build")
                 .args(["--tag", &tag])
-                .args(["--label", &gardr_image_label(image_name)])
+                .args([
+                    "--label",
+                    &gardr_image_label(&store.root_identity(), image_name),
+                ])
                 .arg(context_path)
                 .output()
                 .map_err(io_error)?;
@@ -1654,22 +1672,25 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
 
 /// The Docker `--label` value Gardr attaches to every image it builds for a named profile, so a
 /// later rebuild can find and remove stale tags it created without ever touching an image it
-/// didn't build itself.
-fn gardr_image_label(name: &str) -> String {
-    format!("gardr.image={name}")
+/// didn't build itself. The value is scoped by this store's root identity, not just the profile
+/// name: two independent `--root`/`GARDR_ROOT` roots on one Docker daemon can have a same-named
+/// profile whose build context differs, and without the root component a rebuild in one root
+/// could find and remove the other root's currently-in-use image tag.
+fn gardr_image_label(root_id: &str, name: &str) -> String {
+    format!("gardr.image={root_id}.{name}")
 }
 
-/// Removes Docker tags labeled as belonging to this profile whose repository no longer matches
-/// the just-built `current_tag`. Since a build-context tag is derived from the digest of its
-/// context directory, a stale tag here can only be a previous build of the same profile whose
-/// context has since changed; unlabeled images (never created by Gardr) are never listed or
-/// touched.
-fn remove_stale_build_tags(name: &str, current_tag: &str) -> Result<()> {
+/// Removes Docker tags labeled as belonging to this profile (in this root) whose repository no
+/// longer matches the just-built `current_tag`. Since a build-context tag is derived from the
+/// digest of its context directory, a stale tag here can only be a previous build of the same
+/// profile whose context has since changed; unlabeled images and images labeled for a different
+/// root (never created by this store) are never listed or touched.
+fn remove_stale_build_tags(root_id: &str, name: &str, current_tag: &str) -> Result<()> {
     let output = Command::new("docker")
         .args([
             "images",
             "--filter",
-            &format!("label={}", gardr_image_label(name)),
+            &format!("label={}", gardr_image_label(root_id, name)),
             "--format",
             "{{.Repository}}",
         ])
@@ -3800,7 +3821,13 @@ mod tests {
         let order = fs::read_to_string(&order_file).unwrap();
         assert!(order.contains("--no-cache"), "{order}");
         assert!(order.contains("--pull"), "{order}");
-        assert!(order.contains("--label gardr.image=agent"), "{order}");
+        assert!(
+            order.contains(&format!(
+                "--label gardr.image={}.agent",
+                store.root_identity()
+            )),
+            "{order}"
+        );
         assert!(
             order.contains("rmi gardr-stale-tag"),
             "stale tag from a previous context must be removed: {order}"
@@ -3847,6 +3874,33 @@ mod tests {
             error.contains("boom: container still references this tag"),
             "{error}"
         );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_scopes_the_stale_tag_label_by_root_so_two_roots_never_touch_each_others_images() {
+        let temp = temporary_directory();
+        let store_a = Store::open(temp.join("root-a"));
+        let store_b = Store::open(temp.join("root-b"));
+
+        // Same profile name in two independent roots must not collapse to the same Docker
+        // label: a rebuild in one root must never be able to find, and therefore never remove,
+        // an image tag another root is currently using.
+        let label_a = gardr_image_label(&store_a.root_identity(), "agent");
+        let label_b = gardr_image_label(&store_b.root_identity(), "agent");
+        assert_ne!(
+            label_a, label_b,
+            "two roots with a same-named profile must get distinct Docker labels: {label_a} vs {label_b}"
+        );
+
+        // The identity is stable across repeated calls against the same root...
+        assert_eq!(store_a.root_identity(), store_a.root_identity());
+        // ...and across a fresh `Store::open` of the same path.
+        assert_eq!(
+            store_a.root_identity(),
+            Store::open(temp.join("root-a")).root_identity()
+        );
+
         fs::remove_dir_all(temp).unwrap();
     }
 
