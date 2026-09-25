@@ -15,7 +15,7 @@ Those named directories are the only host paths a spec can request besides the s
 key: `run start`'s command line (`--workspace`/`--image`/`--harness`/`--model`) beats a stored
 spec, which beats the optional global config at `<root>/config.toml` (a missing file is not an
 error). `harness.command` layers the same way between a spec and the global config — there is no
-CLI override for it — falling back to a built-in per-adapter default (`["pi", "--no-session"]` for
+CLI override for it — falling back to a built-in per-adapter default (`["pi"]` for
 the only supported adapter, `pi`) when neither layer sets it. The global config may also name a
 default `spec`; `--spec` is optional on `run start` and overrides it, so a run may start with no
 spec at all when the global config and CLI resolve every required key between them:
@@ -28,7 +28,7 @@ image = "pi-agent"
 
 [harness]
 adapter = "pi"
-command = ["pi", "--no-session"]
+command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
 ```
 
@@ -57,7 +57,7 @@ network = "none" # use "bridge" for Gardr's allowlisted egress firewall
 adapter = "pi"
 # `command` contains only reusable harness arguments; the dispatch supplies
 # prompt/print arguments through `run start --harness-arg`.
-command = ["pi", "--no-session"]
+command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
 
 # The claude-code adapter has no credential bootstrap yet and is rejected at

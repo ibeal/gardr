@@ -275,7 +275,7 @@ const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
-const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\", \"--no-session\"]` for pi).\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys. Use `gardr docs`\nfor lifecycle details and the layering precedence.\n";
+const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\"]` for pi).\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys. Use `gardr docs`\nfor lifecycle details and the layering precedence.\n";
 
 const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   Register (upsert) a credential: gardr credential set <name> --file <path> | --stdin\n  list  Print registered credential names as JSON (values are never included)\n  rm    Remove a registered credential: <name>\n\nCredential values are never printed back by any command. Use `gardr docs` for how a spec's\n[credentials] environment entries resolve a value through this store.\n";
 
@@ -327,7 +327,7 @@ All command results except `spec show` are one JSON document, intended for an or
 the `run start` command line (`--workspace`/`--image`/`--harness`/`--model`) beats a stored spec,
 which beats the optional global config at `<root>/config.toml`. A missing `config.toml` is not an
 error. `harness.command` layers the same way between a spec and the global config (there is no CLI
-override for it), falling back to a built-in per-adapter default (`["pi", "--no-session"]` for the
+override for it), falling back to a built-in per-adapter default (`["pi"]` for the
 only supported adapter, `pi`) when neither layer sets it. The global config may also name a default
 `spec`; `--spec` is optional on `run start` and overrides it — a run may start with no spec at all
 when the global config and CLI resolve every required key between them:
@@ -340,7 +340,7 @@ image = "claude-agent"
 
 [harness]
 adapter = "pi"
-command = ["pi", "--no-session"]
+command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
 ```
 
@@ -370,8 +370,8 @@ network = "none" # or "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
 adapter = "pi"          # the only supported adapter today; see note below
-command = ["pi", "--no-session"] # reusable harness arguments; dispatch arguments
-                                  # such as `-p` belong to `run start --harness-arg`
+command = ["pi"] # reusable harness arguments; dispatch arguments
+                  # such as `-p` belong to `run start --harness-arg`
 model = "anthropic/claude-opus-4-6:high"
 
 [[mounts]]

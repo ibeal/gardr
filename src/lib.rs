@@ -685,7 +685,7 @@ const PI_TRANSCRIPT_MOUNT: &str = "/gardr-transcript";
 /// one.
 fn default_harness_command(adapter: Adapter) -> Vec<String> {
     match adapter {
-        Adapter::Pi => vec!["pi".to_owned(), "--no-session".to_owned()],
+        Adapter::Pi => vec!["pi".to_owned()],
         Adapter::ClaudeCode => vec!["claude".to_owned()],
     }
 }
@@ -2584,10 +2584,7 @@ mod tests {
         let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         let effective =
             resolve_runtime(&global, Some(&spec), &RuntimeOverrides::default()).unwrap();
-        assert_eq!(
-            effective.harness_command.value,
-            vec!["pi".to_owned(), "--no-session".to_owned()]
-        );
+        assert_eq!(effective.harness_command.value, vec!["pi".to_owned()]);
         assert_eq!(effective.harness_command.source, Layer::Default);
     }
 
