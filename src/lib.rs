@@ -232,9 +232,7 @@ impl Store {
     ) -> Result<(RunRecord, Spec)> {
         validate_harness_args(&harness_args)?;
         let global = self.read_global_config()?;
-        let spec_name = spec_name
-            .map(str::to_owned)
-            .or_else(|| global.spec.clone());
+        let spec_name = spec_name.map(str::to_owned).or_else(|| global.spec.clone());
         let (spec_source, identity, content) = match &spec_name {
             Some(name) => {
                 let (spec, identity, content) = self.read_spec(name)?;
@@ -1201,7 +1199,11 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
             );
         }
         if matches!(spec.harness.adapter, Some(Adapter::Pi))
-            && spec.harness.command.first().is_some_and(|command| command != "pi")
+            && spec
+                .harness
+                .command
+                .first()
+                .is_some_and(|command| command != "pi")
         {
             return Err("the pi adapter requires a command beginning with `pi`".to_owned());
         }
@@ -1350,7 +1352,12 @@ fn validate_resolved_harness(harness: &Harness) -> Result<()> {
     }
     match adapter {
         Adapter::ClaudeCode => unreachable!("claude-code rejected above"),
-        Adapter::Pi if harness.command.first().is_some_and(|command| command == "pi") => {
+        Adapter::Pi
+            if harness
+                .command
+                .first()
+                .is_some_and(|command| command == "pi") =>
+        {
             let model = harness
                 .model
                 .as_deref()
@@ -2836,7 +2843,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (record, _spec) = store.create_run(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let (record, _spec) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let transcript_path = record.transcript_path.clone().unwrap();
         assert!(transcript_path.contains(&record.id));
         assert!(Path::new(&transcript_path).parent().unwrap().is_dir());
@@ -2994,7 +3003,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -3055,7 +3066,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -3106,7 +3119,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -3341,7 +3356,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         // Simulate a run that resolved credentials into the plaintext env-file, as `launch` would
         // before invoking `docker run` (independent of exercising the credential-resolution path).
@@ -3390,7 +3407,9 @@ mod tests {
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
 
-        let record = store.start(overrides_for(&workspace), Some("build"), vec![]).unwrap();
+        let record = store
+            .start(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         assert!(matches!(record.state, RunState::Running));
         let directory = store.run_path(&record.id).unwrap();
         assert!(
