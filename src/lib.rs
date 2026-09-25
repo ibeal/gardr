@@ -147,6 +147,63 @@ impl Store {
         validate_image_requirements(self, spec)
     }
 
+    /// Refreshes the Docker image behind a named profile: a build-context profile is rebuilt
+    /// from scratch (no layer cache, base image re-pulled), and a reference profile is re-pulled.
+    /// Docker tags Gardr previously created for this profile that no longer correspond to its
+    /// current build context are removed; a rebuild failure leaves the previously working image
+    /// (and its tag) untouched.
+    pub fn rebuild_image(&self, name: &str) -> Result<ImageRebuildResult> {
+        let (profile, _identity, _content) = self.read_image(name)?;
+        validate_image_profile_runtime(self, &profile)?;
+        if let Some(context) = &profile.source.build_context {
+            let context_path = approved_child(&self.images_path(), context)?;
+            let tag = format!("gardr-{}", digest_directory(&context_path)?);
+            let build = Command::new("docker")
+                .arg("build")
+                .args(["--no-cache", "--pull"])
+                .args(["--tag", &tag])
+                .args(["--label", &gardr_image_label(name)])
+                .arg(&context_path)
+                .output()
+                .map_err(io_error)?;
+            if !build.status.success() {
+                return Err(command_error("docker build", &build));
+            }
+            let image = image_id(&tag)?;
+            remove_stale_build_tags(name, &tag)?;
+            Ok(ImageRebuildResult {
+                name: name.to_owned(),
+                image,
+                source: ImageRebuildSource::Build,
+            })
+        } else {
+            let reference = profile
+                .source
+                .reference
+                .as_deref()
+                .expect("validated image profile reference");
+            let pull = Command::new("docker")
+                .args(["pull", reference])
+                .output()
+                .map_err(io_error)?;
+            if !pull.status.success() {
+                return Err(command_error("docker pull", &pull));
+            }
+            let image = image_id(reference)?;
+            Ok(ImageRebuildResult {
+                name: name.to_owned(),
+                image,
+                source: ImageRebuildSource::Pull,
+            })
+        }
+    }
+
+    /// Rebuilds every named profile in order, stopping at (and reporting) the first failure so a
+    /// docker error is never masked by continuing on to later profiles.
+    pub fn rebuild_images(&self, names: &[String]) -> Result<Vec<ImageRebuildResult>> {
+        names.iter().map(|name| self.rebuild_image(name)).collect()
+    }
+
     pub fn validate_runtime_spec(&self, spec: &Spec) -> Result<()> {
         validate_runtime_spec(self, spec)
     }
@@ -1556,6 +1613,7 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
             let build = Command::new("docker")
                 .arg("build")
                 .args(["--tag", &tag])
+                .args(["--label", &gardr_image_label(image_name)])
                 .arg(context_path)
                 .output()
                 .map_err(io_error)?;
@@ -1585,6 +1643,71 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
         }
         Ok((image_id(reference)?, identity))
     }
+}
+
+/// The Docker `--label` value Gardr attaches to every image it builds for a named profile, so a
+/// later rebuild can find and remove stale tags it created without ever touching an image it
+/// didn't build itself.
+fn gardr_image_label(name: &str) -> String {
+    format!("gardr.image={name}")
+}
+
+/// Removes Docker tags labeled as belonging to this profile whose repository no longer matches
+/// the just-built `current_tag`. Since a build-context tag is derived from the digest of its
+/// context directory, a stale tag here can only be a previous build of the same profile whose
+/// context has since changed; unlabeled images (never created by Gardr) are never listed or
+/// touched.
+fn remove_stale_build_tags(name: &str, current_tag: &str) -> Result<()> {
+    let output = Command::new("docker")
+        .args([
+            "images",
+            "--filter",
+            &format!("label={}", gardr_image_label(name)),
+            "--format",
+            "{{.Repository}}",
+        ])
+        .output()
+        .map_err(io_error)?;
+    if !output.status.success() {
+        return Err(command_error("docker images", &output));
+    }
+    let repositories: BTreeSet<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "<none>")
+        .map(str::to_owned)
+        .collect();
+    for repository in repositories {
+        if repository == current_tag {
+            continue;
+        }
+        let rmi = Command::new("docker")
+            .args(["rmi", &repository])
+            .output()
+            .map_err(io_error)?;
+        if !rmi.status.success() {
+            return Err(command_error("docker rmi", &rmi));
+        }
+    }
+    Ok(())
+}
+
+/// The outcome of one `gardr image rebuild` invocation.
+#[derive(Clone, Debug, Serialize)]
+pub struct ImageRebuildResult {
+    pub name: String,
+    /// The refreshed image's immutable Docker image ID.
+    pub image: String,
+    pub source: ImageRebuildSource,
+}
+/// How a profile's image was refreshed.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageRebuildSource {
+    /// Rebuilt from an approved build context, with no layer cache and the base image re-pulled.
+    Build,
+    /// Re-pulled from an image reference.
+    Pull,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3601,6 +3724,145 @@ mod tests {
             !directory.join("credentials.env").exists(),
             "credentials.env must not survive past docker run returning"
         );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_re_pulls_a_reference_profile_and_returns_its_fresh_image_id() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  pull) echo \"pull $2\" >> \"$ORDER_FILE\"; exit 0 ;;\n  image)\n    if [ \"$2\" = inspect ] && [ \"$3\" = '--format' ]; then\n      echo 'sha256:fresh-pull'\n      exit 0\n    fi\n    echo \"unexpected docker image command: $*\" >&2\n    exit 1\n    ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n"
+            .replace("$ORDER_FILE", &order_file.display().to_string());
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let store = Store::open(temp.join("store"));
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("agent", &profile).unwrap();
+
+        let result = store.rebuild_image("agent").unwrap();
+        assert_eq!(result.name, "agent");
+        assert_eq!(result.image, "sha256:fresh-pull");
+        assert!(matches!(result.source, ImageRebuildSource::Pull));
+        assert!(
+            fs::read_to_string(&order_file)
+                .unwrap()
+                .contains("pull example:latest")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_rebuilds_a_build_context_profile_without_cache_and_removes_stale_tags() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let store = Store::open(temp.join("store"));
+        let context = store.images_path().join("agent-ctx");
+        fs::create_dir_all(&context).unwrap();
+        fs::write(context.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        let current_tag = format!("gardr-{}", digest_directory(&context).unwrap());
+
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  build) echo \"build $*\" >> \"$ORDER_FILE\"; exit 0 ;;\n  image)\n    if [ \"$2\" = inspect ] && [ \"$3\" = '--format' ]; then\n      echo 'sha256:fresh-build'\n      exit 0\n    fi\n    echo \"unexpected docker image command: $*\" >&2\n    exit 1\n    ;;\n  images) echo \"$CURRENT_TAG\"; echo 'gardr-stale-tag'; exit 0 ;;\n  rmi) echo \"rmi $2\" >> \"$ORDER_FILE\"; exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n"
+            .replace("$ORDER_FILE", &order_file.display().to_string())
+            .replace("$CURRENT_TAG", &current_tag);
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['pi']\n[source]\nbuild_context = 'agent-ctx'\n",
+        )
+        .unwrap();
+        store.add_image("agent", &profile).unwrap();
+
+        let result = store.rebuild_image("agent").unwrap();
+        assert_eq!(result.name, "agent");
+        assert_eq!(result.image, "sha256:fresh-build");
+        assert!(matches!(result.source, ImageRebuildSource::Build));
+
+        let order = fs::read_to_string(&order_file).unwrap();
+        assert!(order.contains("--no-cache"), "{order}");
+        assert!(order.contains("--pull"), "{order}");
+        assert!(order.contains("--label gardr.image=agent"), "{order}");
+        assert!(
+            order.contains("rmi gardr-stale-tag"),
+            "stale tag from a previous context must be removed: {order}"
+        );
+        assert!(
+            !order.contains(&format!("rmi {current_tag}")),
+            "the freshly built tag must never be removed: {order}"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_failure_reports_the_docker_error_and_leaves_the_previous_tag_untouched() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let store = Store::open(temp.join("store"));
+        let context = store.images_path().join("agent-ctx");
+        fs::create_dir_all(&context).unwrap();
+        fs::write(context.join("Dockerfile"), b"FROM scratch\n").unwrap();
+
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  build) echo \"build $*\" >> \"$ORDER_FILE\"; echo 'boom: base image unavailable' >&2; exit 1 ;;\n  rmi) echo \"rmi $2\" >> \"$ORDER_FILE\"; exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n"
+            .replace("$ORDER_FILE", &order_file.display().to_string());
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['pi']\n[source]\nbuild_context = 'agent-ctx'\n",
+        )
+        .unwrap();
+        store.add_image("agent", &profile).unwrap();
+
+        let error = store.rebuild_image("agent").unwrap_err();
+        assert!(error.contains("boom: base image unavailable"), "{error}");
+        assert!(
+            !order_file.exists() || !fs::read_to_string(&order_file).unwrap().contains("rmi"),
+            "a failed rebuild must never remove an existing tag"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_all_refreshes_every_stored_profile_in_one_invocation() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let store = Store::open(temp.join("store"));
+
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  pull) echo \"pull $2\" >> \"$ORDER_FILE\"; exit 0 ;;\n  image)\n    if [ \"$2\" = inspect ] && [ \"$3\" = '--format' ]; then\n      echo \"sha256:fresh-$4\"\n      exit 0\n    fi\n    echo \"unexpected docker image command: $*\" >&2\n    exit 1\n    ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n"
+            .replace("$ORDER_FILE", &order_file.display().to_string());
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let first = temp.join("first.toml");
+        fs::write(
+            &first,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'first:latest'\n",
+        )
+        .unwrap();
+        store.add_image("first", &first).unwrap();
+        let second = temp.join("second.toml");
+        fs::write(
+            &second,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'second:latest'\n",
+        )
+        .unwrap();
+        store.add_image("second", &second).unwrap();
+
+        let names = store.list_images().unwrap();
+        assert_eq!(names, ["first", "second"]);
+        let results = store.rebuild_images(&names).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "first");
+        assert_eq!(results[1].name, "second");
+        let order = fs::read_to_string(&order_file).unwrap();
+        assert!(order.contains("pull first:latest"));
+        assert!(order.contains("pull second:latest"));
         fs::remove_dir_all(temp).unwrap();
     }
 }

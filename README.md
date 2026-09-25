@@ -110,6 +110,8 @@ install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "l
 ```sh
 gardr image add pi-agent --file pi-agent.toml
 gardr image validate pi-agent
+gardr image rebuild pi-agent                # refresh one profile's image
+gardr image rebuild --all                   # refresh every stored profile's image
 gardr spec add build --file build.toml
 gardr spec validate build
 gardr spec list
@@ -152,6 +154,16 @@ tools = ["git", "node"]
 [source]
 reference = "ghcr.io/example/pi-agent@sha256:..."
 ```
+
+`gardr image rebuild <name>` refreshes the Docker image behind a named profile without changing the
+immutable profile: a build-context profile is rebuilt from scratch (no layer cache, base image
+re-pulled), and a reference profile is re-pulled. `--all` refreshes every stored profile in one
+invocation. The next `run start` using that profile resolves to the freshly refreshed image with no
+further action. Docker tags Gardr previously created for a rebuilt build-context profile that no
+longer match its current context directory are removed; images Gardr did not create are never
+touched. A rebuild failure reports the docker error and leaves the previously working image in
+place. Refresh is always explicit: there is no remote registry, automatic staleness detection, or
+scheduled rebuild.
 
 Gardr owns a private credential registry under `<root>/credentials/`, independent of
 `mounts`/`specs`/`images`, with private (0700/0600) permissions. `gardr credential set <name>

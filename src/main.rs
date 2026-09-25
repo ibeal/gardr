@@ -130,6 +130,17 @@ fn image(store: &Store, mut args: Vec<String>) -> Result<(), String> {
             }
             print_json(&identity)
         }
+        "rebuild" => {
+            let all = flag(&mut args, "--all");
+            if all {
+                reject_extra(&args)?;
+                print_json(&store.rebuild_images(&store.list_images()?)?)
+            } else {
+                let name = take(&mut args)?;
+                reject_extra(&args)?;
+                print_json(&store.rebuild_image(&name)?)
+            }
+        }
         _ => Err(usage()),
     }
 }
@@ -284,7 +295,7 @@ const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nU
 
 const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nFirewall policy is global-only: a spec cannot declare [firewall], and `spec add` rejects one that\ndoes. A spec's [sandbox] network may only narrow the global config's network default to \"none\".\n\nA spec's [credentials] environment entries resolve from the `gardr credential` store, not from\ngardr's own process environment; see `gardr credential --help` and `gardr docs`.\n\nUse `gardr docs` for the specification format.\n";
 
-const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
+const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n  rebuild   Refresh the image behind a profile: gardr image rebuild <name> | --all\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\n`rebuild` rebuilds a build-context profile from scratch (no layer cache, base image re-pulled) or\nre-pulls a reference profile; a run started afterward resolves the freshly refreshed image without\nfurther action. `--all` rebuilds every stored profile in one invocation. A rebuild failure reports\nthe docker error and leaves the previously working image and tag in place.\n\nUse `gardr docs` for the image profile format.\n";
 
 const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--network none] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\"]` for pi).\n\nNetwork mode (`none`/`bridge`) and the egress firewall allowlist are global-only, at\n<root>/config.toml. `--network none` (or a spec's `[sandbox] network = \"none\"`) may only narrow\nthe global default to `none`; neither can force `bridge`. A bridge run whose global config has no\nnon-empty `[firewall] allow` fails explicitly at `run start`; there is no hardcoded minimum or\nseparate installer allowlist. See `gardr docs`.\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys, plus the resolved\nnetwork mode and frozen firewall allowlist. Use `gardr docs` for lifecycle details and the\nlayering precedence.\n";
 
@@ -309,6 +320,8 @@ gardr image add <name> --file <path>     # validate and store an immutable image
 gardr image list                         # JSON list of stored image profiles
 gardr image show <name>                  # print the TOML and its SHA-256 to stderr
 gardr image validate <name>              # JSON identity for one image profile
+gardr image rebuild <name>               # refresh the image behind one profile
+gardr image rebuild --all                # refresh the image behind every stored profile
 
 gardr spec add <name> --file <path>      # validate and store an immutable spec
 gardr spec list                          # JSON list of stored names
@@ -430,6 +443,16 @@ name = "go"
 check = "go"
 install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "latest"], ["asdf", "set", "-u", "golang", "latest"]]
 ```
+
+`gardr image rebuild` refreshes the Docker image behind a named profile without touching the
+immutable profile itself: a build-context profile is rebuilt with no layer cache and its base image
+re-pulled, and a reference profile is re-pulled. `--all` refreshes every stored profile in one
+invocation. The next `run start` using that profile resolves the freshly refreshed image with no
+further action. Docker tags Gardr previously created for a rebuilt build-context profile that no
+longer correspond to its current context directory are removed; images Gardr did not create are
+never touched. A rebuild failure reports the docker error and leaves the previously working image
+and tag in place. Rebuilding is always explicit — there is no automatic staleness detection or
+scheduled refresh.
 
 An image profile is host-owned policy and declares a single source, its supported harnesses, and the
 preinstalled tools it provides:
