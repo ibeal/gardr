@@ -170,11 +170,17 @@ impl Store {
                 return Err(command_error("docker build", &build));
             }
             let image = image_id(&tag)?;
-            remove_stale_build_tags(name, &tag)?;
+            // The image is already rebuilt and re-tagged at this point, so a failure removing a
+            // now-stale tag (e.g. `docker rmi` refusing because a stopped-but-not-yet-cleaned-up
+            // run's container still references it, which is normal until `gardr run cleanup`)
+            // must not be reported as the rebuild itself failing. Surface it on the result
+            // instead of propagating it as this call's Err.
+            let stale_removal_error = remove_stale_build_tags(name, &tag).err();
             Ok(ImageRebuildResult {
                 name: name.to_owned(),
                 image,
                 source: ImageRebuildSource::Build,
+                stale_removal_error,
             })
         } else {
             let reference = profile
@@ -194,6 +200,7 @@ impl Store {
                 name: name.to_owned(),
                 image,
                 source: ImageRebuildSource::Pull,
+                stale_removal_error: None,
             })
         }
     }
@@ -1699,6 +1706,12 @@ pub struct ImageRebuildResult {
     /// The refreshed image's immutable Docker image ID.
     pub image: String,
     pub source: ImageRebuildSource,
+    /// Set when the rebuild itself succeeded (`image` is fresh) but removing a now-stale tag
+    /// previously created by Gardr for this profile failed, e.g. because a stopped run's
+    /// container still references it. Best-effort: the caller should not treat this as a
+    /// rebuild failure, only as a cleanup that did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_removal_error: Option<String>,
 }
 /// How a profile's image was refreshed.
 #[derive(Clone, Debug, Serialize)]
@@ -3795,6 +3808,44 @@ mod tests {
         assert!(
             !order.contains(&format!("rmi {current_tag}")),
             "the freshly built tag must never be removed: {order}"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rebuild_reports_a_failed_stale_tag_removal_without_failing_the_rebuild() {
+        let temp = temporary_directory();
+        let order_file = temp.join("order.log");
+        let store = Store::open(temp.join("store"));
+        let context = store.images_path().join("agent-ctx");
+        fs::create_dir_all(&context).unwrap();
+        fs::write(context.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        let current_tag = format!("gardr-{}", digest_directory(&context).unwrap());
+
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  build) echo \"build $*\" >> \"$ORDER_FILE\"; exit 0 ;;\n  image)\n    if [ \"$2\" = inspect ] && [ \"$3\" = '--format' ]; then\n      echo 'sha256:fresh-build'\n      exit 0\n    fi\n    echo \"unexpected docker image command: $*\" >&2\n    exit 1\n    ;;\n  images) echo \"$CURRENT_TAG\"; echo 'gardr-stale-tag'; exit 0 ;;\n  rmi) echo \"rmi $2\" >> \"$ORDER_FILE\"; echo 'boom: container still references this tag' >&2; exit 1 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n"
+            .replace("$ORDER_FILE", &order_file.display().to_string())
+            .replace("$CURRENT_TAG", &current_tag);
+        let _docker = FakeDocker::install(&script, &temp.join("bin"));
+
+        let profile = temp.join("agent.toml");
+        fs::write(
+            &profile,
+            b"version = 1\nharnesses = ['pi']\n[source]\nbuild_context = 'agent-ctx'\n",
+        )
+        .unwrap();
+        store.add_image("agent", &profile).unwrap();
+
+        let result = store
+            .rebuild_image("agent")
+            .expect("a stale-tag removal failure must not fail the rebuild");
+        assert_eq!(result.image, "sha256:fresh-build");
+        assert!(matches!(result.source, ImageRebuildSource::Build));
+        let error = result
+            .stale_removal_error
+            .expect("the failed removal is reported on the result");
+        assert!(
+            error.contains("boom: container still references this tag"),
+            "{error}"
         );
         fs::remove_dir_all(temp).unwrap();
     }

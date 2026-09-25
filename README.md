@@ -160,9 +160,12 @@ immutable profile: a build-context profile is rebuilt from scratch (no layer cac
 re-pulled), and a reference profile is re-pulled. `--all` refreshes every stored profile in one
 invocation. The next `run start` using that profile resolves to the freshly refreshed image with no
 further action. Docker tags Gardr previously created for a rebuilt build-context profile that no
-longer match its current context directory are removed; images Gardr did not create are never
-touched. A rebuild failure reports the docker error and leaves the previously working image in
-place. Refresh is always explicit: there is no remote registry, automatic staleness detection, or
+longer match its current context directory are removed on a best-effort basis: removal failure
+(e.g. a stopped run's container still referencing the stale tag) is reported on the result's
+`stale_removal_error` rather than failing the rebuild, since the image was already rebuilt
+successfully by that point. Images Gardr did not create are never touched. A rebuild failure (the
+build or pull itself) reports the docker error and leaves the previously working image in place.
+Refresh is always explicit: there is no remote registry, automatic staleness detection, or
 scheduled rebuild.
 
 Gardr owns a private credential registry under `<root>/credentials/`, independent of
