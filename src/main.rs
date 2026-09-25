@@ -175,13 +175,16 @@ fn credential(store: &Store, mut args: Vec<String>) -> Result<(), String> {
 fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
     match take(&mut args)?.as_str() {
         "start" => {
-            let workspace = option(&mut args, "--workspace")
-                .ok_or_else(|| "--workspace is required".to_owned())?;
-            let spec =
-                option(&mut args, "--spec").ok_or_else(|| "--spec is required".to_owned())?;
+            let overrides = gardr::RuntimeOverrides {
+                workspace: option(&mut args, "--workspace"),
+                image: option(&mut args, "--image"),
+                harness: option(&mut args, "--harness"),
+                model: option(&mut args, "--model"),
+            };
+            let spec = option(&mut args, "--spec");
             let harness_args = options(&mut args, "--harness-arg");
             reject_extra(&args)?;
-            print_json(&store.start(PathBuf::from(workspace).as_path(), &spec, harness_args)?)
+            print_json(&store.start(overrides, spec.as_deref(), harness_args)?)
         }
         "observe" => {
             let id = take(&mut args)?;
@@ -266,13 +269,13 @@ fn usage() -> String {
     HELP.trim_end().to_owned()
 }
 
-const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  spec       Manage sandbox specifications\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nCredential commands:\n  set, list, rm\n\nRun `gardr spec --help`, `gardr run --help`, or `gardr credential --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
+const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  spec       Manage sandbox specifications\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nCredential commands:\n  set, list, rm\n\nRun `gardr spec --help`, `gardr run --help`, or `gardr credential --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n\nAn optional <root>/config.toml supplies global defaults for workspace/image/harness/model/spec;\nsee `gardr run --help` and `gardr docs` for the layering precedence.\n";
 
 const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nA spec's [credentials] environment entries resolve from the `gardr credential` store, not from\ngardr's own process environment; see `gardr credential --help` and `gardr docs`.\n\nUse `gardr docs` for the specification format.\n";
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
-const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a sealed workspace: --workspace <path> --spec <name> [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\nRun commands return one JSON document. Use `gardr docs` for lifecycle details.\n";
+const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\"]` for pi).\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys. Use `gardr docs`\nfor lifecycle details and the layering precedence.\n";
 
 const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   Register (upsert) a credential: gardr credential set <name> --file <path> | --stdin\n  list  Print registered credential names as JSON (values are never included)\n  rm    Remove a registered credential: <name>\n\nCredential values are never printed back by any command. Use `gardr docs` for how a spec's\n[credentials] environment entries resolve a value through this store.\n";
 
@@ -302,8 +305,10 @@ gardr spec show <name>                   # print the TOML and its SHA-256 to std
 gardr spec validate <name>               # JSON identity for one stored spec
 
 gardr run validate-workspace <path>      # validate a prepared, sealed workspace
-gardr run start --workspace <path> --spec <name> [--harness-arg <arg>]...
-gardr run observe <run-id>               # reconcile and return current run state
+gardr run start [--workspace <path>] [--spec <name>] [--image <name>] [--harness <adapter>]
+                [--model <name>] [--harness-arg <arg>]...
+gardr run observe <run-id>               # reconcile and return current run state; reports the
+                                          # effective value and source layer for each layered key
 gardr run resume <run-id>                # restart a stopped or failed run
 gardr run stop <run-id>                  # stop a running container
 gardr run cleanup <run-id>               # remove a non-running container; idempotent
@@ -316,21 +321,57 @@ gardr credential rm <name>                  # remove a registered credential
 
 All command results except `spec show` are one JSON document, intended for an orchestrator to read.
 
+## Layered runtime configuration
+
+`workspace`, `image`, `harness` (the adapter name), and `model` resolve from three layers, per key:
+the `run start` command line (`--workspace`/`--image`/`--harness`/`--model`) beats a stored spec,
+which beats the optional global config at `<root>/config.toml`. A missing `config.toml` is not an
+error. `harness.command` layers the same way between a spec and the global config (there is no CLI
+override for it), falling back to a built-in per-adapter default (`["pi"]` for the
+only supported adapter, `pi`) when neither layer sets it. The global config may also name a default
+`spec`; `--spec` is optional on `run start` and overrides it — a run may start with no spec at all
+when the global config and CLI resolve every required key between them:
+
+```toml
+# <root>/config.toml (all keys optional)
+workspace = "/workspaces/default"
+spec = "build"
+image = "claude-agent"
+
+[harness]
+adapter = "pi"
+command = ["pi"]
+model = "anthropic/claude-opus-4-6:high"
+```
+
+A spec no longer has to set `image` or `harness.model` (or, for that matter, `workspace` or
+`harness.adapter`/`harness.command`): whatever a layer leaves unset, the next layer down supplies.
+A required key left unset by every layer fails `run start` explicitly, naming the key and the
+layers consulted (`cli`, `spec`, `global`). Validations that used to run only at `spec add` —
+supported adapter, the image profile provides the harness, a provider-qualified model,
+`tools.required` satisfied by the image — now run at `run start`/`run resume` against the *merged*
+result instead, since any of those values may come from a different layer than the others.
+`spec add` still rejects a spec whose own values (whichever it sets) are invalid. The merged
+effective value and its source layer, for every layered key, are frozen into the run record at
+`run start` and reported by both `run start` and `run observe`; `run resume` uses those frozen
+values verbatim and never re-merges the layers, so a later edit to the global config or a
+re-registered spec can never change a run already in flight.
+
 ## A sandbox specification
 
 ```toml
 version = 1
 
-[image]
-name = "claude-agent" # <root>/images/claude-agent.toml
+# workspace, [image] name, and [harness] adapter/command/model are all optional here: whichever
+# of them the global config or `run start` flags supply, this spec doesn't need to repeat.
 
 [sandbox]
 network = "none" # or "bridge" for Gardr's allowlisted egress firewall
 
 [harness]
 adapter = "pi"          # the only supported adapter today; see note below
-command = ["pi", "--no-session"] # reusable harness arguments; dispatch arguments
-                                  # such as `-p` belong to `run start --harness-arg`
+command = ["pi"] # reusable harness arguments; dispatch arguments
+                  # such as `-p` belong to `run start --harness-arg`
 model = "anthropic/claude-opus-4-6:high"
 
 [[mounts]]
@@ -400,13 +441,15 @@ runtime contract: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that fai
 ## Workspace and lifecycle
 
 `run start` accepts only a prepared workspace containing one or more sealed entries under
-`dispatches/`. Gardr mounts that workspace at `/workspace`, freezes the selected spec, records the
-workspace seal and approved mounts, then starts Docker. It never falls back to host execution.
+`dispatches/`. Gardr mounts that workspace at `/workspace`, freezes the merged effective runtime
+configuration (and the selected spec, if any), records the workspace seal and approved mounts, then
+starts Docker. It never falls back to host execution.
 
-Each run has a directory at `<root>/runs/<run-id>/` containing the frozen `spec.toml`, resolved
-configuration, run state, mount lock, runner log, and artifacts directory. `resume` revalidates the
-workspace seal, frozen spec, and approved mounts before launching again. `cleanup` is terminal and
-refuses a running run; stop it first.
+Each run has a directory at `<root>/runs/<run-id>/` containing the frozen spec (`spec.toml`, absent
+when the run started with no `--spec`), resolved configuration, run state, mount lock, runner log,
+and artifacts directory. `resume` revalidates the workspace seal, frozen spec (if any), and approved
+mounts before launching again, using the frozen effective values verbatim; it never re-merges the
+global config, spec, or CLI layers. `cleanup` is terminal and refuses a running run; stop it first.
 
 For the pi adapter, Gardr always writes pi's session transcript to
 `<root>/runs/<run-id>/transcript/session.jsonl`, overriding any `--no-session` left in a spec's

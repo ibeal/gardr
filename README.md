@@ -9,12 +9,46 @@ that location; `--root` takes precedence. Its store contains `specs/`, `runs/`, 
 mount directories under `mounts/`, and named image profiles and optional Docker build contexts under `images/`.
 Those named directories are the only host paths a spec can request besides the supplied workspace.
 
+## Layered runtime configuration
+
+`workspace`, `image`, `harness` (the adapter name), and `model` each resolve from three layers, per
+key: `run start`'s command line (`--workspace`/`--image`/`--harness`/`--model`) beats a stored
+spec, which beats the optional global config at `<root>/config.toml` (a missing file is not an
+error). `harness.command` layers the same way between a spec and the global config — there is no
+CLI override for it — falling back to a built-in per-adapter default (`["pi"]` for
+the only supported adapter, `pi`) when neither layer sets it. The global config may also name a
+default `spec`; `--spec` is optional on `run start` and overrides it, so a run may start with no
+spec at all when the global config and CLI resolve every required key between them:
+
+```toml
+# ~/.gardr/config.toml (every key optional)
+workspace = "/workspaces/default"
+spec = "build"
+image = "pi-agent"
+
+[harness]
+adapter = "pi"
+command = ["pi"]
+model = "anthropic/claude-opus-4-6:high"
+```
+
+A spec no longer has to set `image` or `harness.model` (or `workspace`/`harness.adapter`/
+`harness.command`); whatever a layer leaves unset, the next layer down supplies. A required key
+left unset by every layer fails `run start` explicitly, naming the key and the layers consulted
+(`cli`, `spec`, `global`). Validations that used to run only at `spec add` — supported adapter, the
+image profile provides the harness, a provider-qualified model, `tools.required` satisfied by the
+image — now run at `run start`/`run resume` against the *merged* result, since those values can
+come from different layers. `spec add` still rejects a spec whose own values are invalid. The
+merged effective value and its source layer, for every layered key, are frozen into the run record
+at `run start` and reported by both `run start` and `run observe`; `run resume` uses the frozen
+values verbatim and never re-merges the layers.
+
 ```toml
 # build.toml
 version = 1
 
-[image]
-name = "pi-agent" # resolves only to the configured root's images/pi-agent.toml
+# workspace, [image] name, and [harness] adapter/command/model are all optional here: whichever of
+# them the global config or `run start` flags supply, this spec doesn't need to repeat.
 
 [sandbox]
 network = "none" # use "bridge" for Gardr's allowlisted egress firewall
@@ -23,7 +57,7 @@ network = "none" # use "bridge" for Gardr's allowlisted egress firewall
 adapter = "pi"
 # `command` contains only reusable harness arguments; the dispatch supplies
 # prompt/print arguments through `run start --harness-arg`.
-command = ["pi", "--no-session"]
+command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
 
 # The claude-code adapter has no credential bootstrap yet and is rejected at
@@ -60,6 +94,7 @@ gardr spec add build --file build.toml
 gardr spec validate build
 gardr spec list
 gardr run start --workspace /workspaces/task --spec build --harness-arg -p --harness-arg "complete the assigned work"
+gardr run start --harness-arg -p --harness-arg "go"   # workspace/spec/image/harness/model from config.toml
 gardr run observe run-…
 gardr run stop run-…
 gardr run cleanup run-…
@@ -71,9 +106,11 @@ gardr credential rm github-read-only-pat
 
 All command results except `spec show` are single JSON documents for orchestration. `run observe`
 does not inspect a workspace, stream logs, attach a terminal, or interpret handoff content. Each
-run writes immutable `spec.toml` and `resolved.json`, then mutable `state.json` and `runner.log`
-under the configured root's `runs/<run-id>/`. Resume validates the sealed workspace and uses the frozen spec;
-it never silently replaces state. Cleanup is idempotent and refuses a running run.
+run writes the frozen spec (`spec.toml`, absent when the run started with no `--spec`) and
+`resolved.json`, then mutable `state.json` and `runner.log`, under the configured root's
+`runs/<run-id>/`. `resume` validates the sealed workspace and uses the frozen spec and frozen
+effective runtime values verbatim, never re-merging the global config, spec, or CLI layers or
+silently replacing state. Cleanup is idempotent and refuses a running run.
 
 For `adapter = "pi"`, Gardr always persists pi's session transcript under
 `runs/<run-id>/transcript/session.jsonl`, even if a spec's reusable `harness.command` still
@@ -129,8 +166,8 @@ reported as an explicit runner failure rather than treated as agent-workflow suc
 
 For `adapter = "pi"`, Gardr bootstraps its managed `<root>/pi/agent/` directory from only the
 host `~/.pi/agent/auth.json`, mounts that directory at `/pi-agent`, and sets
-`PI_CODING_AGENT_DIR`. Pi's `--model` is injected from the required provider-qualified
-`harness.model`. The initial supported providers are `anthropic` and `openai-codex`; their
+`PI_CODING_AGENT_DIR`. Pi's `--model` is injected from the merged, provider-qualified `model`.
+The initial supported providers are `anthropic` and `openai-codex`; their
 runtime API domains are added to bridge egress. Gardr never mounts the host Pi directory.
 
 For `network = "bridge"`, Gardr follows the containerized-agent firewall model: it resolves each

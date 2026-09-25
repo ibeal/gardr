@@ -40,6 +40,18 @@ impl Store {
         validate_name("image profile name", name)?;
         Ok(self.images_path().join(format!("{name}.toml")))
     }
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+    /// Reads the optional global config at `<root>/config.toml`. A missing file is not an error;
+    /// it resolves to an all-`None` `GlobalConfig`.
+    pub fn read_global_config(&self) -> Result<GlobalConfig> {
+        match fs::read(self.config_path()) {
+            Ok(content) => parse_global_config(&content),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(GlobalConfig::default()),
+            Err(error) => Err(io_error(error)),
+        }
+    }
     pub fn pi_agent_path(&self) -> PathBuf {
         self.root.join("pi").join("agent")
     }
@@ -67,7 +79,6 @@ impl Store {
         let content = fs::read(source).map_err(io_error)?;
         let spec = parse_spec(&content)?;
         validate_spec(&spec)?;
-        self.validate_image_requirements(&spec)?;
         fs::create_dir_all(self.specs_path()).map_err(io_error)?;
         write_new(&destination, &content)?;
         Ok(SpecIdentity {
@@ -136,7 +147,7 @@ impl Store {
         validate_image_requirements(self, spec)
     }
 
-    pub fn validate_runtime_spec(&self, spec: &Spec) -> Result<SpecIdentity> {
+    pub fn validate_runtime_spec(&self, spec: &Spec) -> Result<()> {
         validate_runtime_spec(self, spec)
     }
 
@@ -215,16 +226,26 @@ impl Store {
 
     pub fn create_run(
         &self,
-        workspace: &Path,
-        spec_name: &str,
+        overrides: RuntimeOverrides,
+        spec_name: Option<&str>,
         harness_args: Vec<String>,
     ) -> Result<(RunRecord, Spec)> {
-        let workspace = validate_workspace(workspace)?;
         validate_harness_args(&harness_args)?;
-        let (spec, identity, content) = self.read_spec(spec_name)?;
+        let global = self.read_global_config()?;
+        let spec_name = spec_name.map(str::to_owned).or_else(|| global.spec.clone());
+        let (spec_source, identity, content) = match &spec_name {
+            Some(name) => {
+                let (spec, identity, content) = self.read_spec(name)?;
+                (Some(spec), Some(identity), Some(content))
+            }
+            None => (None, None, None),
+        };
+        let effective = resolve_runtime(&global, spec_source.as_ref(), &overrides)?;
+        let spec = apply_effective_runtime(spec_source.unwrap_or_else(implicit_spec), &effective);
         validate_dispatch_harness_args(&spec, &harness_args)?;
         sync_pi_auth(self, &spec)?;
-        validate_runtime_spec(self, &spec)?;
+        validate_resolved_spec(self, &spec)?;
+        let workspace = validate_workspace(Path::new(&effective.workspace.value))?;
         fs::create_dir_all(self.runs_path()).map_err(io_error)?;
         let id = new_run_id();
         let directory = self.run_path(&id)?;
@@ -234,6 +255,7 @@ impl Store {
             id: id.clone(),
             state: RunState::Prepared,
             spec: identity,
+            effective: effective.clone(),
             workspace: workspace.display().to_string(),
             image: None,
             image_profile: None,
@@ -246,7 +268,7 @@ impl Store {
             log_path: directory.join("runner.log").display().to_string(),
             artifact_path: directory.join("artifacts").display().to_string(),
             harness_args,
-            transcript_path: matches!(spec.harness.adapter, Adapter::Pi).then(|| {
+            transcript_path: matches!(spec.harness.adapter, Some(Adapter::Pi)).then(|| {
                 directory
                     .join("transcript")
                     .join("session.jsonl")
@@ -258,8 +280,10 @@ impl Store {
             usage: None,
             usage_error: None,
         };
-        write_new(&directory.join("spec.toml"), &content)?;
-        if matches!(spec.harness.adapter, Adapter::Pi) {
+        if let Some(content) = &content {
+            write_new(&directory.join("spec.toml"), content)?;
+        }
+        if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
             fs::create_dir(directory.join("transcript")).map_err(io_error)?;
         }
         let mounts = lock_mounts(self, &spec)?;
@@ -309,14 +333,24 @@ impl Store {
         if directory.join("cleanup.complete").exists() {
             return Err("cleaned runs are terminal and cannot be resumed".to_owned());
         }
-        let workspace = validate_workspace(Path::new(&record.workspace))?;
-        let frozen = fs::read(directory.join("spec.toml")).map_err(io_error)?;
-        if digest(&frozen) != record.spec.sha256 {
-            return Err("frozen run spec does not match recorded spec identity".to_owned());
-        }
-        let spec = parse_spec(&frozen)?;
-        validate_spec(&spec)?;
-        validate_runtime_spec(self, &spec)?;
+        // `resume` never re-merges the global/spec/CLI layers: it uses the frozen effective
+        // values recorded at `run start` and only reloads the frozen spec.toml (if any) for the
+        // static, unlayered fields (sandbox, mounts, credentials, firewall, tools).
+        let workspace = validate_workspace(Path::new(&record.effective.workspace.value))?;
+        let baseline = match &record.spec {
+            Some(identity) => {
+                let frozen = fs::read(directory.join("spec.toml")).map_err(io_error)?;
+                if digest(&frozen) != identity.sha256 {
+                    return Err("frozen run spec does not match recorded spec identity".to_owned());
+                }
+                let spec = parse_spec(&frozen)?;
+                validate_spec(&spec)?;
+                spec
+            }
+            None => implicit_spec(),
+        };
+        let spec = apply_effective_runtime(baseline, &record.effective);
+        validate_resolved_spec(self, &spec)?;
         verify_locked_mounts(self, &spec, &directory)?;
         if !directory.join("resolved.json").is_file()
             || record.image.is_none()
@@ -331,11 +365,11 @@ impl Store {
 
     pub fn start(
         &self,
-        workspace: &Path,
-        spec_name: &str,
+        overrides: RuntimeOverrides,
+        spec_name: Option<&str>,
         harness_args: Vec<String>,
     ) -> Result<RunRecord> {
-        let (record, spec) = self.create_run(workspace, spec_name, harness_args)?;
+        let (record, spec) = self.create_run(overrides, spec_name, harness_args)?;
         let workspace = PathBuf::from(&record.workspace);
         self.launch(record, workspace, spec)
     }
@@ -476,12 +510,17 @@ impl Store {
                 Err(error) => return fail_run(&directory, &mut record, error),
             },
         };
+        let spec_label = record
+            .spec
+            .as_ref()
+            .map(|identity| identity.name.as_str())
+            .unwrap_or("adhoc");
         let arguments = match docker_arguments(
             self,
             &spec,
             &workspace,
             &directory,
-            &record.spec.name,
+            spec_label,
             &record.id,
             &image,
             &record.harness_args,
@@ -550,8 +589,14 @@ fn fail_run(directory: &Path, record: &mut RunRecord, error: String) -> Result<R
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub version: u32,
+    /// The default workspace path for this spec, layered under global config and overridden by
+    /// `run start --workspace`. Rarely set; most specs leave workspace selection to the CLI.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
     pub image: Image,
     pub sandbox: Sandbox,
+    #[serde(default)]
     pub harness: Harness,
     #[serde(default)]
     pub mounts: Vec<Mount>,
@@ -562,10 +607,11 @@ pub struct Spec {
     #[serde(default)]
     pub tools: Tooling,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Image {
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -596,24 +642,264 @@ pub enum Network {
     None,
     Bridge,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Harness {
-    pub adapter: Adapter,
+    #[serde(default)]
+    pub adapter: Option<Adapter>,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
     ClaudeCode,
     Pi,
 }
+impl std::str::FromStr for Adapter {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "pi" => Ok(Adapter::Pi),
+            "claude-code" => Ok(Adapter::ClaudeCode),
+            other => Err(format!("unknown harness adapter: {other}")),
+        }
+    }
+}
+impl std::fmt::Display for Adapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_string(self).unwrap().trim_matches('"')
+        )
+    }
+}
 pub const CLAUDE_CODE_UNSUPPORTED: &str = "the claude-code adapter is not supported: it has no credential bootstrap yet; use the pi adapter with an Anthropic model instead";
 /// Container path where the pi adapter's writable transcript directory is mounted.
 const PI_TRANSCRIPT_MOUNT: &str = "/gardr-transcript";
+
+/// Default `harness.command` per adapter, used when neither a spec nor the global config sets
+/// one.
+fn default_harness_command(adapter: Adapter) -> Vec<String> {
+    match adapter {
+        Adapter::Pi => vec!["pi".to_owned()],
+        Adapter::ClaudeCode => vec!["claude".to_owned()],
+    }
+}
+
+/// The optional global config at `<root>/config.toml`. Every key is a default consulted only when
+/// the spec and CLI layers leave it unset; a missing file resolves to every field `None`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalConfig {
+    /// Default workspace path, overridden by a spec's `workspace` and by `run start --workspace`.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Default spec name, overridden by `run start --spec`.
+    #[serde(default)]
+    pub spec: Option<String>,
+    /// Default image profile name, overridden by a spec's `image.name` and `run start --image`.
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub harness: Option<GlobalHarness>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalHarness {
+    /// Default harness adapter, overridden by a spec's `harness.adapter` and `run start --harness`.
+    #[serde(default)]
+    pub adapter: Option<Adapter>,
+    /// Default `harness.command`, overridden only by a spec's `harness.command` (there is no CLI
+    /// override); falls back to `default_harness_command` when unset everywhere.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Default harness model, overridden by a spec's `harness.model` and `run start --model`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
+    toml::from_str(
+        std::str::from_utf8(content)
+            .map_err(|error| format!("global config is not UTF-8: {error}"))?,
+    )
+    .map_err(|error| format!("invalid global config: {error}"))
+}
+
+/// The `run start` command-line overrides for the four layered runtime keys. Each, if present,
+/// wins over the spec and global config layers for that key.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeOverrides {
+    pub workspace: Option<String>,
+    pub image: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Which layer supplied a resolved runtime value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    Cli,
+    Spec,
+    Global,
+    /// No layer set the key; an adapter-specific built-in default was used. Only ever the source
+    /// for `harness_command`.
+    Default,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Resolved<T> {
+    pub value: T,
+    pub source: Layer,
+}
+/// The fully merged runtime configuration for one run: the effective value of each of the four
+/// layered keys (`workspace`, `image`, `harness`, `model`), plus `harness_command`, and which
+/// layer supplied each. Frozen into the run record at `run start`; `resume` uses it verbatim and
+/// never re-merges.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EffectiveRuntime {
+    pub workspace: Resolved<String>,
+    pub image: Resolved<String>,
+    pub harness: Resolved<Adapter>,
+    pub model: Resolved<String>,
+    pub harness_command: Resolved<Vec<String>>,
+}
+
+/// Merges one required layered key: CLI overrides the spec, which overrides the global config.
+/// Fails explicitly, naming the key and the layers consulted, when no layer set it.
+fn merge_required(
+    key: &str,
+    cli: Option<String>,
+    spec: Option<String>,
+    global: Option<String>,
+) -> Result<(String, Layer)> {
+    if let Some(value) = cli {
+        return Ok((value, Layer::Cli));
+    }
+    if let Some(value) = spec {
+        return Ok((value, Layer::Spec));
+    }
+    if let Some(value) = global {
+        return Ok((value, Layer::Global));
+    }
+    Err(format!(
+        "missing required configuration key `{key}`: checked cli, spec, and global layers"
+    ))
+}
+/// Merges `harness.command`: spec overrides global config; there is no CLI override. Falls back
+/// to the resolved adapter's built-in default when neither layer sets it.
+fn merge_harness_command(
+    spec: Option<Vec<String>>,
+    global: Option<Vec<String>>,
+    adapter: Adapter,
+) -> (Vec<String>, Layer) {
+    if let Some(command) = spec {
+        return (command, Layer::Spec);
+    }
+    if let Some(command) = global {
+        return (command, Layer::Global);
+    }
+    (default_harness_command(adapter), Layer::Default)
+}
+/// Merges the global config, an optional spec, and `run start` CLI overrides into one
+/// `EffectiveRuntime`, per-key precedence CLI > spec > global. Fails explicitly, naming the key
+/// and the layers consulted, when a required key resolves to nothing.
+fn resolve_runtime(
+    global: &GlobalConfig,
+    spec: Option<&Spec>,
+    overrides: &RuntimeOverrides,
+) -> Result<EffectiveRuntime> {
+    let global_harness = global.harness.as_ref();
+    let workspace = merge_required(
+        "workspace",
+        overrides.workspace.clone(),
+        spec.and_then(|spec| spec.workspace.clone()),
+        global.workspace.clone(),
+    )?;
+    let image = merge_required(
+        "image",
+        overrides.image.clone(),
+        spec.and_then(|spec| spec.image.name.clone()),
+        global.image.clone(),
+    )?;
+    let (harness_name, harness_source) = merge_required(
+        "harness",
+        overrides.harness.clone(),
+        spec.and_then(|spec| spec.harness.adapter)
+            .map(|adapter| adapter.to_string()),
+        global_harness
+            .and_then(|harness| harness.adapter)
+            .map(|adapter| adapter.to_string()),
+    )?;
+    let adapter = harness_name.parse::<Adapter>()?;
+    let model = merge_required(
+        "model",
+        overrides.model.clone(),
+        spec.and_then(|spec| spec.harness.model.clone()),
+        global_harness.and_then(|harness| harness.model.clone()),
+    )?;
+    let harness_command = merge_harness_command(
+        spec.map(|spec| spec.harness.command.clone())
+            .filter(|command| !command.is_empty()),
+        global_harness
+            .and_then(|harness| harness.command.clone())
+            .filter(|command| !command.is_empty()),
+        adapter,
+    );
+    Ok(EffectiveRuntime {
+        workspace: Resolved {
+            value: workspace.0,
+            source: workspace.1,
+        },
+        image: Resolved {
+            value: image.0,
+            source: image.1,
+        },
+        harness: Resolved {
+            value: adapter,
+            source: harness_source,
+        },
+        model: Resolved {
+            value: model.0,
+            source: model.1,
+        },
+        harness_command: Resolved {
+            value: harness_command.0,
+            source: harness_command.1,
+        },
+    })
+}
+/// The neutral baseline used when a run has no spec at all: no image/harness/model of its own (all
+/// filled in by `apply_effective_runtime`), no mounts/credentials/tools, and network `none` since
+/// firewall policy has no layering of its own yet (a later ticket moves it to global-only config).
+fn implicit_spec() -> Spec {
+    Spec {
+        version: 1,
+        workspace: None,
+        image: Image::default(),
+        sandbox: Sandbox {
+            network: Network::None,
+        },
+        harness: Harness::default(),
+        mounts: Vec::new(),
+        credentials: Credentials::default(),
+        firewall: Firewall::default(),
+        tools: Tooling::default(),
+    }
+}
+/// Overwrites a baseline spec's layered fields (`image.name`, `harness.adapter`,
+/// `harness.command`, `harness.model`) with the merged effective values, leaving every unlayered
+/// field (sandbox, mounts, credentials, firewall, tools) exactly as the baseline declared it.
+fn apply_effective_runtime(mut spec: Spec, effective: &EffectiveRuntime) -> Spec {
+    spec.image.name = Some(effective.image.value.clone());
+    spec.harness.adapter = Some(effective.harness.value);
+    spec.harness.command = effective.harness_command.value.clone();
+    spec.harness.model = Some(effective.model.value.clone());
+    spec
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
@@ -694,7 +980,12 @@ pub struct RunRecord {
     pub version: u32,
     pub id: String,
     pub state: RunState,
-    pub spec: SpecIdentity,
+    /// The stored spec's identity, or `None` when the run resolved entirely from global config
+    /// and CLI overrides with no `--spec`.
+    pub spec: Option<SpecIdentity>,
+    /// The merged runtime configuration frozen at `run start`. `resume` uses these values
+    /// verbatim and never re-merges the global config, spec, or CLI layers.
+    pub effective: EffectiveRuntime,
     pub workspace: String,
     pub image: Option<String>,
     #[serde(default)]
@@ -762,7 +1053,8 @@ impl std::fmt::Display for RunState {
 struct ResolvedConfig<'a> {
     run_id: &'a str,
     workspace: String,
-    spec: &'a SpecIdentity,
+    spec: &'a Option<SpecIdentity>,
+    effective: &'a EffectiveRuntime,
     image: &'a Image,
     image_profile: &'a Option<SpecIdentity>,
     image_id: &'a Option<String>,
@@ -803,6 +1095,7 @@ impl<'a> ResolvedConfig<'a> {
             run_id: &record.id,
             workspace: record.workspace.clone(),
             spec: &record.spec,
+            effective: &record.effective,
             image: &spec.image,
             image_profile: &record.image_profile,
             image_id: &record.image,
@@ -824,7 +1117,7 @@ impl<'a> ResolvedConfig<'a> {
                 effective: installer_domains(spec),
             },
             tools: &spec.tools,
-            pi_agent: matches!(spec.harness.adapter, Adapter::Pi).then(|| ResolvedPiAgent {
+            pi_agent: matches!(spec.harness.adapter, Some(Adapter::Pi)).then(|| ResolvedPiAgent {
                 source: store.pi_agent_path().display().to_string(),
                 target: "/pi-agent",
             }),
@@ -878,49 +1171,45 @@ pub fn validate_image_profile(image: &ImageProfile) -> Result<()> {
     }
     Ok(())
 }
+/// Validates only the values a spec itself sets. `image.name`, `harness.adapter`, `harness.model`,
+/// and `harness.command` may all be absent (deferred to the global config or `run start` CLI
+/// flags); whatever the spec DOES set must be individually valid. Completeness of the merged
+/// result (all four resolved, mutually consistent, and matched by an image profile) is checked
+/// only at run resolve time, against the merged result — see `validate_resolved_harness`.
 pub fn validate_spec(spec: &Spec) -> Result<()> {
     if spec.version != 1 {
         return Err("run spec version must be 1".to_owned());
     }
-    validate_name("image name", &spec.image.name)?;
-    if matches!(spec.harness.adapter, Adapter::ClaudeCode) {
+    if let Some(name) = &spec.image.name {
+        validate_name("image name", name)?;
+    }
+    if matches!(spec.harness.adapter, Some(Adapter::ClaudeCode)) {
         return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
     }
-    if spec.harness.command.is_empty() {
-        return Err("harness.command is required".to_owned());
-    }
-    match spec.harness.adapter {
-        Adapter::ClaudeCode => {
-            unreachable!("claude-code rejected above")
+    if !spec.harness.command.is_empty() {
+        if spec
+            .harness
+            .command
+            .iter()
+            .any(|argument| is_pi_reserved_argument(argument))
+        {
+            return Err(
+                "the pi adapter command must not contain dispatch or model-selection arguments"
+                    .to_owned(),
+            );
         }
-        Adapter::Pi
-            if spec
+        if matches!(spec.harness.adapter, Some(Adapter::Pi))
+            && spec
                 .harness
                 .command
                 .first()
-                .is_some_and(|command| command == "pi") =>
+                .is_some_and(|command| command != "pi")
         {
-            let model = spec
-                .harness
-                .model
-                .as_deref()
-                .ok_or_else(|| "the pi adapter requires harness.model".to_owned())?;
-            validate_pi_model(model)?;
-            if spec
-                .harness
-                .command
-                .iter()
-                .any(|argument| is_pi_reserved_argument(argument))
-            {
-                return Err(
-                    "the pi adapter command must not contain dispatch or model-selection arguments"
-                        .to_owned(),
-                );
-            }
-        }
-        Adapter::Pi => {
             return Err("the pi adapter requires a command beginning with `pi`".to_owned());
         }
+    }
+    if let Some(model) = &spec.harness.model {
+        validate_pi_model(model)?;
     }
     let mut names = BTreeSet::new();
     let mut targets = BTreeSet::new();
@@ -997,38 +1286,109 @@ fn validate_image_profile_runtime(store: &Store, image: &ImageProfile) -> Result
     }
     Ok(())
 }
+/// Cross-checks the merged result's `image` against the image profile store: the profile must
+/// exist, support the resolved `harness` adapter, and provide every `tools.required` capability.
+/// Callers must pass a spec whose `image.name` and `harness.adapter` are already resolved
+/// (`Some`); this is only meaningful against a fully merged runtime, never a spec in isolation.
 fn validate_image_requirements(store: &Store, spec: &Spec) -> Result<SpecIdentity> {
-    let (image, identity, _) = store.read_image(&spec.image.name)?;
+    let image_name = spec
+        .image
+        .name
+        .as_deref()
+        .ok_or_else(|| "missing required configuration key `image`".to_owned())?;
+    let adapter = spec
+        .harness
+        .adapter
+        .as_ref()
+        .ok_or_else(|| "missing required configuration key `harness`".to_owned())?;
+    let (image, identity, _) = store.read_image(image_name)?;
     validate_image_profile_runtime(store, &image)?;
-    if !image.harnesses.iter().any(|adapter| {
-        std::mem::discriminant(adapter) == std::mem::discriminant(&spec.harness.adapter)
-    }) {
+    if !image
+        .harnesses
+        .iter()
+        .any(|candidate| std::mem::discriminant(candidate) == std::mem::discriminant(adapter))
+    {
         return Err(format!(
             "image profile {} does not support the {} harness",
-            spec.image.name,
-            serde_json::to_string(&spec.harness.adapter)
-                .unwrap()
-                .trim_matches('"')
+            image_name,
+            serde_json::to_string(adapter).unwrap().trim_matches('"')
         ));
     }
     for tool in &spec.tools.required {
         if !image.tools.contains(tool) {
             return Err(format!(
-                "image profile {} does not provide required tool: {tool}",
-                spec.image.name
+                "image profile {image_name} does not provide required tool: {tool}"
             ));
         }
     }
     Ok(identity)
 }
-fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<SpecIdentity> {
-    if matches!(spec.harness.adapter, Adapter::Pi) {
+/// Validates a spec's own, unlayered runtime dependencies: the managed Pi authentication
+/// directory (if the resolved adapter is `pi`) and that declared mounts name approved store
+/// entries. Does not require `image`/`harness.model` to be resolved, so it stays usable against a
+/// spec that hasn't been merged with global config or CLI overrides yet (e.g. `spec validate`).
+fn validate_runtime_spec(store: &Store, spec: &Spec) -> Result<()> {
+    if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         validate_pi_agent(store)?;
     }
     for mount in &spec.mounts {
         approved_child(&store.mounts_path(), &mount.name)?;
     }
-    validate_image_requirements(store, spec)
+    Ok(())
+}
+/// Validates that the merged `harness` (adapter, command, model) is complete and internally
+/// consistent: the resolved fields formerly checked only at `spec add` — supported adapter,
+/// command shape, provider-qualified model — now checked against the merged result.
+fn validate_resolved_harness(harness: &Harness) -> Result<()> {
+    let adapter = harness
+        .adapter
+        .as_ref()
+        .ok_or_else(|| "missing required configuration key `harness`".to_owned())?;
+    if matches!(adapter, Adapter::ClaudeCode) {
+        return Err(CLAUDE_CODE_UNSUPPORTED.to_owned());
+    }
+    if harness.command.is_empty() {
+        return Err("harness.command is required".to_owned());
+    }
+    match adapter {
+        Adapter::ClaudeCode => unreachable!("claude-code rejected above"),
+        Adapter::Pi
+            if harness
+                .command
+                .first()
+                .is_some_and(|command| command == "pi") =>
+        {
+            let model = harness
+                .model
+                .as_deref()
+                .ok_or_else(|| "missing required configuration key `model`".to_owned())?;
+            validate_pi_model(model)?;
+            if harness
+                .command
+                .iter()
+                .any(|argument| is_pi_reserved_argument(argument))
+            {
+                return Err(
+                    "the pi adapter command must not contain dispatch or model-selection arguments"
+                        .to_owned(),
+                );
+            }
+        }
+        Adapter::Pi => {
+            return Err("the pi adapter requires a command beginning with `pi`".to_owned());
+        }
+    }
+    Ok(())
+}
+/// Runs every validation formerly performed only at `spec add` — supported adapter, image profile
+/// provides the harness, provider-qualified model, `tools.required` satisfied by the image —
+/// against the merged result, plus the spec's own unlayered runtime dependencies (mounts, managed
+/// Pi authentication). Called at `run start`/`run resume`, never at `spec add`.
+fn validate_resolved_spec(store: &Store, spec: &Spec) -> Result<()> {
+    validate_resolved_harness(&spec.harness)?;
+    validate_runtime_spec(store, spec)?;
+    validate_image_requirements(store, spec)?;
+    Ok(())
 }
 fn lock_mounts(store: &Store, spec: &Spec) -> Result<Vec<MountLock>> {
     spec.mounts
@@ -1067,7 +1427,12 @@ pub fn validate_workspace(path: &Path) -> Result<PathBuf> {
 }
 
 fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
-    let (profile, identity, _) = store.read_image(&spec.image.name)?;
+    let image_name = spec
+        .image
+        .name
+        .as_deref()
+        .expect("ensure_image called against a resolved spec");
+    let (profile, identity, _) = store.read_image(image_name)?;
     validate_image_profile_runtime(store, &profile)?;
     if let Some(context) = &profile.source.build_context {
         let context_path = approved_child(&store.images_path(), context)?;
@@ -1170,7 +1535,7 @@ fn docker_arguments(
             ),
         ]);
     }
-    if matches!(spec.harness.adapter, Adapter::Pi) {
+    if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         let agent = store.pi_agent_path();
         validate_docker_path("Pi agent path", &agent)?;
         args.extend([
@@ -1226,7 +1591,7 @@ fn docker_arguments(
     }
     let mut command = spec.harness.command.clone();
     command.extend(harness_args.iter().cloned());
-    if matches!(spec.harness.adapter, Adapter::Pi) {
+    if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         // Gardr manages the pi transcript itself; a reusable `command` may still carry
         // `--no-session` (e.g. today's example specs), so drop it rather than requiring specs
         // to be rewritten.
@@ -1237,7 +1602,7 @@ fn docker_arguments(
         injected.push("--model".to_owned());
         injected.push(model.clone());
     }
-    if matches!(spec.harness.adapter, Adapter::Pi) {
+    if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         injected.push("--session".to_owned());
         injected.push(format!("{PI_TRANSCRIPT_MOUNT}/session.jsonl"));
     }
@@ -1308,7 +1673,7 @@ fn validate_pi_model(value: &str) -> Result<()> {
 }
 
 fn sync_pi_auth(store: &Store, spec: &Spec) -> Result<()> {
-    if !matches!(spec.harness.adapter, Adapter::Pi) {
+    if !matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         return Ok(());
     }
     if store.pi_agent_path().join("auth.json").exists() {
@@ -1818,7 +2183,7 @@ fn validate_harness_args(arguments: &[String]) -> Result<()> {
     }
 }
 fn validate_dispatch_harness_args(spec: &Spec, arguments: &[String]) -> Result<()> {
-    if matches!(spec.harness.adapter, Adapter::Pi)
+    if matches!(spec.harness.adapter, Some(Adapter::Pi))
         && arguments.iter().any(|argument| {
             is_pi_model_selection_argument(argument) || is_pi_session_management_argument(argument)
         })
@@ -1951,6 +2316,14 @@ mod tests {
             }
         }
     }
+    /// Builds `RuntimeOverrides` supplying only `--workspace`, for tests exercising a spec that
+    /// already sets image/harness/model itself.
+    fn overrides_for(workspace: &Path) -> RuntimeOverrides {
+        RuntimeOverrides {
+            workspace: Some(workspace.display().to_string()),
+            ..Default::default()
+        }
+    }
     fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gardr-test-{}-{}",
@@ -2002,9 +2375,12 @@ mod tests {
         let supported = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[tools]\nrequired = ['git']\n").unwrap();
         store.validate_runtime_spec(&supported).unwrap();
         let missing_tool = parse_spec(b"version = 1\n[image]\nname = 'agent'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[tools]\nrequired = ['go']\n").unwrap();
+        // `tools.required` satisfaction is checked against the image profile store at run
+        // resolve time (`validate_image_requirements`), not by `validate_runtime_spec`, which
+        // only checks a spec's own unlayered runtime dependencies (mounts, managed Pi auth).
         assert!(
             store
-                .validate_runtime_spec(&missing_tool)
+                .validate_image_requirements(&missing_tool)
                 .unwrap_err()
                 .contains("required tool")
         );
@@ -2117,8 +2493,17 @@ mod tests {
         assert!(runtime_domains(&valid).contains(&"api.openai.com".to_owned()));
         assert!(runtime_domains(&valid).contains(&"chatgpt.com".to_owned()));
 
+        // A spec no longer has to set harness.model itself: it may be deferred to the global
+        // config or `run start --model`. `validate_spec` (spec add) only validates a model that
+        // IS present; requiring one to be present after merging is `validate_resolved_harness`'s
+        // job, exercised in the layered-config resolution tests.
         let missing_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
-        assert!(validate_spec(&missing_model).unwrap_err().contains("model"));
+        assert!(validate_spec(&missing_model).is_ok());
+        assert!(
+            validate_resolved_harness(&missing_model.harness)
+                .unwrap_err()
+                .contains("model")
+        );
         let print_mode = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(
             validate_spec(&print_mode)
@@ -2128,6 +2513,200 @@ mod tests {
         let overridden_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(validate_spec(&overridden_model).is_err());
         assert!(validate_dispatch_harness_args(&valid, &["--model=other".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn resolve_runtime_precedence_is_cli_over_spec_over_global() {
+        let global = GlobalConfig {
+            workspace: Some("/global/workspace".to_owned()),
+            image: Some("global-image".to_owned()),
+            harness: Some(GlobalHarness {
+                adapter: Some(Adapter::Pi),
+                command: Some(vec!["pi".to_owned(), "--global".to_owned()]),
+                model: Some("anthropic/global-model".to_owned()),
+            }),
+            spec: Some("global-spec".to_owned()),
+        };
+        let spec = parse_spec(b"version = 1\nworkspace = '/spec/workspace'\n[image]\nname = 'spec-image'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--spec-flag']\nmodel = 'anthropic/spec-model'\n").unwrap();
+
+        // No CLI overrides: every key comes from the spec, since the spec sets all of them.
+        let from_spec =
+            resolve_runtime(&global, Some(&spec), &RuntimeOverrides::default()).unwrap();
+        assert_eq!(from_spec.workspace.value, "/spec/workspace");
+        assert_eq!(from_spec.workspace.source, Layer::Spec);
+        assert_eq!(from_spec.image.value, "spec-image");
+        assert_eq!(from_spec.image.source, Layer::Spec);
+        assert_eq!(from_spec.harness.value, Adapter::Pi);
+        assert_eq!(from_spec.harness.source, Layer::Spec);
+        assert_eq!(from_spec.model.value, "anthropic/spec-model");
+        assert_eq!(from_spec.model.source, Layer::Spec);
+        assert_eq!(from_spec.harness_command.value, vec!["pi", "--spec-flag"]);
+        assert_eq!(from_spec.harness_command.source, Layer::Spec);
+
+        // CLI overrides win over the spec, which still wins over the global config.
+        let overrides = RuntimeOverrides {
+            workspace: Some("/cli/workspace".to_owned()),
+            image: Some("cli-image".to_owned()),
+            harness: None,
+            model: Some("anthropic/cli-model".to_owned()),
+        };
+        let merged = resolve_runtime(&global, Some(&spec), &overrides).unwrap();
+        assert_eq!(merged.workspace.value, "/cli/workspace");
+        assert_eq!(merged.workspace.source, Layer::Cli);
+        assert_eq!(merged.image.value, "cli-image");
+        assert_eq!(merged.image.source, Layer::Cli);
+        assert_eq!(merged.model.value, "anthropic/cli-model");
+        assert_eq!(merged.model.source, Layer::Cli);
+        // harness (adapter) has no CLI override here, so it falls back to the spec.
+        assert_eq!(merged.harness.value, Adapter::Pi);
+        assert_eq!(merged.harness.source, Layer::Spec);
+
+        // With no spec at all, every key falls back to the global config.
+        let global_only = resolve_runtime(&global, None, &RuntimeOverrides::default()).unwrap();
+        assert_eq!(global_only.workspace.value, "/global/workspace");
+        assert_eq!(global_only.workspace.source, Layer::Global);
+        assert_eq!(global_only.image.value, "global-image");
+        assert_eq!(global_only.image.source, Layer::Global);
+        assert_eq!(global_only.harness.value, Adapter::Pi);
+        assert_eq!(global_only.harness.source, Layer::Global);
+        assert_eq!(global_only.model.value, "anthropic/global-model");
+        assert_eq!(global_only.model.source, Layer::Global);
+        assert_eq!(global_only.harness_command.value, vec!["pi", "--global"]);
+        assert_eq!(global_only.harness_command.source, Layer::Global);
+    }
+
+    #[test]
+    fn resolve_runtime_falls_back_to_the_default_harness_command_when_unset() {
+        let global = GlobalConfig {
+            workspace: Some("/workspace".to_owned()),
+            ..Default::default()
+        };
+        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        let effective =
+            resolve_runtime(&global, Some(&spec), &RuntimeOverrides::default()).unwrap();
+        assert_eq!(effective.harness_command.value, vec!["pi".to_owned()]);
+        assert_eq!(effective.harness_command.source, Layer::Default);
+    }
+
+    #[test]
+    fn resolve_runtime_reports_a_clear_error_naming_the_missing_key_and_layers() {
+        let global = GlobalConfig::default();
+        let error = resolve_runtime(&global, None, &RuntimeOverrides::default()).unwrap_err();
+        assert!(error.contains('`'), "{error}");
+        assert!(error.contains("cli") && error.contains("spec") && error.contains("global"));
+        // The first key checked (workspace) is the one that's reported missing.
+        assert!(error.contains("workspace"), "{error}");
+    }
+
+    #[test]
+    fn create_run_resolves_from_global_config_alone_with_no_spec() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(workspace.join("dispatches")).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        fs::write(
+            store.config_path(),
+            format!(
+                "workspace = '{}'\nimage = 'example'\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
+                workspace.display()
+            ),
+        )
+        .unwrap();
+
+        let (record, spec) = store
+            .create_run(RuntimeOverrides::default(), None, vec![])
+            .unwrap();
+        assert!(record.spec.is_none(), "no --spec was given");
+        assert_eq!(record.effective.image.value, "example");
+        assert_eq!(record.effective.image.source, Layer::Global);
+        assert_eq!(record.effective.harness.source, Layer::Global);
+        assert_eq!(record.effective.model.source, Layer::Global);
+        assert!(matches!(spec.sandbox.network, Network::None));
+        assert!(!directory_has_spec_toml(&store, &record.id));
+
+        let reloaded = store.read_run(&record.id).unwrap();
+        assert_eq!(reloaded.effective.image.value, "example");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    fn directory_has_spec_toml(store: &Store, run_id: &str) -> bool {
+        store.run_path(run_id).unwrap().join("spec.toml").is_file()
+    }
+
+    #[test]
+    fn create_run_rejects_a_missing_required_key_naming_it() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let overrides = RuntimeOverrides {
+            workspace: Some(workspace.display().to_string()),
+            ..Default::default()
+        };
+        let error = store.create_run(overrides, None, vec![]).unwrap_err();
+        assert!(error.contains("image"), "{error}");
+    }
+
+    #[test]
+    fn resume_uses_the_frozen_effective_values_and_never_re_merges() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
+        assert_eq!(record.effective.model.value, "anthropic/claude-opus-4-6");
+
+        // Simulate the global config changing after the run was created; `resume` must not
+        // pick up the new value, since it never re-merges the layers.
+        fs::write(
+            store.config_path(),
+            "[harness]\nmodel = 'anthropic/a-different-model'\n",
+        )
+        .unwrap();
+
+        let directory = store.run_path(&record.id).unwrap();
+        record.state = RunState::Stopped;
+        record.image = Some("image-id".to_owned());
+        record.image_profile = Some(SpecIdentity {
+            name: "example".to_owned(),
+            sha256: "deadbeef".to_owned(),
+        });
+        save_record(&directory, &record).unwrap();
+        write_new(&directory.join("resolved.json"), b"{}").unwrap();
+
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  run) echo 'fake-container'; exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n";
+        let _docker = FakeDocker::install(script, &temp.join("bin"));
+
+        let resumed = store.resume(&record.id).unwrap();
+        assert_eq!(resumed.effective.model.value, "anthropic/claude-opus-4-6");
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -2261,7 +2840,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (record, _spec) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let (record, _spec) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let transcript_path = record.transcript_path.clone().unwrap();
         assert!(transcript_path.contains(&record.id));
         assert!(Path::new(&transcript_path).parent().unwrap().is_dir());
@@ -2419,7 +3000,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -2480,7 +3063,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -2531,7 +3116,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         record.state = RunState::Running;
         record.container = Some("fake-container".to_owned());
@@ -2766,7 +3353,9 @@ mod tests {
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
-        let (mut record, _) = store.create_run(&workspace, "build", vec![]).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         let directory = store.run_path(&record.id).unwrap();
         // Simulate a run that resolved credentials into the plaintext env-file, as `launch` would
         // before invoking `docker run` (independent of exercising the credential-resolution path).
@@ -2815,7 +3404,9 @@ mod tests {
         set_private_directory(&store.pi_agent_path()).unwrap();
         set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
 
-        let record = store.start(&workspace, "build", vec![]).unwrap();
+        let record = store
+            .start(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
         assert!(matches!(record.state, RunState::Running));
         let directory = store.run_path(&record.id).unwrap();
         assert!(
