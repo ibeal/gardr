@@ -25,12 +25,34 @@ spec at all when the global config and CLI resolve every required key between th
 workspace = "/workspaces/default"
 spec = "build"
 image = "pi-agent"
+network = "bridge" # or "none"; the sandbox network default for every run
 
 [harness]
 adapter = "pi"
 command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
+
+[firewall]
+# The single egress allowlist applied to every bridge run. There is no per-spec [firewall], no
+# hardcoded minimum, and no separate installer-only domain set.
+allow = ["packages.example.com"]
 ```
+
+### Network and firewall are global-only
+
+`network` (`none`/`bridge`) and the egress allowlist live only in `<root>/config.toml`; a spec
+cannot declare `[firewall]`, and `spec add` rejects one that does. Gardr ships no hardcoded minimum
+allowlist and has no separate maximum or installer-only domain set: every bridge run, and every
+tool install within it, uses exactly the global `[firewall] allow` list. A spec's own `[sandbox]
+network`, and a future `run start --network`, may only *narrow* the global default to `"none"`;
+neither can force `bridge`. A bridge run whose global config has no non-empty `[firewall] allow`
+fails explicitly at `run start` rather than starting with open or empty egress. The resolved
+network mode and firewall allowlist are frozen into the run record at `run start`, exactly like the
+four layered runtime keys; `resume` reuses them verbatim and never re-reads the global config. A
+stored spec that still declares `[firewall]` or `[[tools.install]].allow` fails to load with a
+clear error naming the removed key. Provider API domains implied by the effective `model`
+(`api.anthropic.com`, or `api.openai.com`/`chatgpt.com`) are added to bridge egress automatically,
+in addition to the global allowlist, so an operator never has to list them by hand.
 
 A spec no longer has to set `image` or `harness.model` (or `workspace`/`harness.adapter`/
 `harness.command`); whatever a layer leaves unset, the next layer down supplies. A required key
@@ -51,7 +73,9 @@ version = 1
 # them the global config or `run start` flags supply, this spec doesn't need to repeat.
 
 [sandbox]
-network = "none" # use "bridge" for Gardr's allowlisted egress firewall
+# Optional: may only narrow the global config's network default to "none". Omit this to use
+# whatever the global config resolves.
+network = "none"
 
 [harness]
 adapter = "pi"
@@ -74,17 +98,13 @@ read_only = true
 # registered secret can be reused under several names.
 environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat" }]
 
-# Bridge runs start with Gardr's minimum egress policy plus these domains.
-[firewall]
-allow = ["packages.example.com"]
-
-# Each tool is checked first. Missing tools run their declared commands while
-# the listed domains are temporarily added, then Gardr reapplies runtime egress.
+# Firewall policy lives only in the global config now; a spec cannot declare [firewall].
+# Each tool is checked first; missing tools run their declared install commands against the
+# same global [firewall] allow list, then Gardr reapplies the policy before the harness starts.
 [[tools.install]]
 name = "go"
 check = "go"
 install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "latest"], ["asdf", "set", "-u", "golang", "latest"]]
-allow = ["go.dev", "storage.googleapis.com"]
 ```
 
 ```sh
@@ -172,8 +192,9 @@ runtime API domains are added to bridge egress. Gardr never mounts the host Pi d
 
 For `network = "bridge"`, Gardr follows the containerized-agent firewall model: it resolves each
 allowed domain at startup, adds the resolved IPs to an ipset, pins the selected address in
-`/etc/hosts`, and drops other egress. The specification is trusted and named, so there is no
-separate firewall maximum. Gardr records both normal runtime egress and the temporary installer
-egress in `resolved.json`. The selected image must provide the same Debian-style runtime contract as
-the Gardr agent image: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that starts its harness
-only after `/usr/local/bin/init-firewall.sh` succeeds.
+`/etc/hosts`, and drops other egress. There is exactly one egress allowlist — the global config's
+`[firewall] allow` plus the provider domains implied by the effective `model` — recorded in
+`resolved.json`; there is no hardcoded minimum, no separate maximum, and no separate installer-only
+domain set. The selected image must provide the same Debian-style runtime contract as the Gardr
+agent image: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that starts its harness only
+after `/usr/local/bin/init-firewall.sh` succeeds.

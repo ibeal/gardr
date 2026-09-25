@@ -175,11 +175,22 @@ fn credential(store: &Store, mut args: Vec<String>) -> Result<(), String> {
 fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
     match take(&mut args)?.as_str() {
         "start" => {
+            let network = option(&mut args, "--network");
+            let network_none = match network.as_deref() {
+                None => false,
+                Some("none") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "--network only accepts 'none' (bridge is decided by the global config): {other}"
+                    ));
+                }
+            };
             let overrides = gardr::RuntimeOverrides {
                 workspace: option(&mut args, "--workspace"),
                 image: option(&mut args, "--image"),
                 harness: option(&mut args, "--harness"),
                 model: option(&mut args, "--model"),
+                network_none,
             };
             let spec = option(&mut args, "--spec");
             let harness_args = options(&mut args, "--harness-arg");
@@ -271,11 +282,11 @@ fn usage() -> String {
 
 const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  spec       Manage sandbox specifications\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nImage and spec commands:\n  add, list, show, validate\n\nRun commands:\n  start, observe, resume, stop, cleanup, validate-workspace\n\nCredential commands:\n  set, list, rm\n\nRun `gardr spec --help`, `gardr run --help`, or `gardr credential --help` for command details.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n\nAn optional <root>/config.toml supplies global defaults for workspace/image/harness/model/spec;\nsee `gardr run --help` and `gardr docs` for the layering precedence.\n";
 
-const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nA spec's [credentials] environment entries resolve from the `gardr credential` store, not from\ngardr's own process environment; see `gardr credential --help` and `gardr docs`.\n\nUse `gardr docs` for the specification format.\n";
+const SPEC_HELP: &str = "Manage sandbox specifications\n\nUsage: gardr [--root <path>] spec <COMMAND>\n\nCommands:\n  add       Validate and store a spec: gardr spec add <name> --file <path>\n  list      Print stored spec names as JSON\n  show      Print a stored spec; writes its SHA-256 to stderr\n  validate  Print a stored spec's identity as JSON\n\nNote: harness.adapter = \"claude-code\" is not supported today (no credential bootstrap); `spec add`\nrejects it. Use \"pi\" with an Anthropic model instead.\n\nFirewall policy is global-only: a spec cannot declare [firewall], and `spec add` rejects one that\ndoes. A spec's [sandbox] network may only narrow the global config's network default to \"none\".\n\nA spec's [credentials] environment entries resolve from the `gardr credential` store, not from\ngardr's own process environment; see `gardr credential --help` and `gardr docs`.\n\nUse `gardr docs` for the specification format.\n";
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
-const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\"]` for pi).\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys. Use `gardr docs`\nfor lifecycle details and the layering precedence.\n";
+const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               Start a run: [--workspace <path>] [--spec <name>] [--image <name>]\n                      [--harness <adapter>] [--model <name>] [--network none] [--harness-arg <arg>]...\n  observe             Reconcile and print a run: <run-id>\n  resume              Restart a stopped or failed run: <run-id>\n  stop                Stop a running run: <run-id>\n  cleanup             Remove a non-running container: <run-id>\n  validate-workspace  Validate a prepared, sealed workspace: <path>\n\n`run start` resolves workspace, image, harness, and model from three layers, per key:\n  --workspace/--image/--harness/--model (CLI) > the stored spec named by --spec (or the global\n  config's default spec) > <root>/config.toml (global defaults). `--spec` is optional: a run may\n  start with no spec at all when the global config and CLI resolve every required key. A key left\n  unset by every layer fails `run start` explicitly, naming the key and the layers consulted.\n  `harness.command` layers the same way between the spec and global config (no CLI override),\n  falling back to a built-in per-adapter default (`[\"pi\"]` for pi).\n\nNetwork mode (`none`/`bridge`) and the egress firewall allowlist are global-only, at\n<root>/config.toml. `--network none` (or a spec's `[sandbox] network = \"none\"`) may only narrow\nthe global default to `none`; neither can force `bridge`. A bridge run whose global config has no\nnon-empty `[firewall] allow` fails explicitly at `run start`; there is no hardcoded minimum or\nseparate installer allowlist. See `gardr docs`.\n\nRun commands return one JSON document, including the effective value and source layer\n(`cli`/`spec`/`global`/`default`) gardr used for each of the four layered keys, plus the resolved\nnetwork mode and frozen firewall allowlist. Use `gardr docs` for lifecycle details and the\nlayering precedence.\n";
 
 const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   Register (upsert) a credential: gardr credential set <name> --file <path> | --stdin\n  list  Print registered credential names as JSON (values are never included)\n  rm    Remove a registered credential: <name>\n\nCredential values are never printed back by any command. Use `gardr docs` for how a spec's\n[credentials] environment entries resolve a value through this store.\n";
 
@@ -306,7 +317,7 @@ gardr spec validate <name>               # JSON identity for one stored spec
 
 gardr run validate-workspace <path>      # validate a prepared, sealed workspace
 gardr run start [--workspace <path>] [--spec <name>] [--image <name>] [--harness <adapter>]
-                [--model <name>] [--harness-arg <arg>]...
+                [--model <name>] [--network none] [--harness-arg <arg>]...
 gardr run observe <run-id>               # reconcile and return current run state; reports the
                                           # effective value and source layer for each layered key
 gardr run resume <run-id>                # restart a stopped or failed run
@@ -337,12 +348,38 @@ when the global config and CLI resolve every required key between them:
 workspace = "/workspaces/default"
 spec = "build"
 image = "claude-agent"
+network = "bridge" # or "none"; the sandbox network default for every run
 
 [harness]
 adapter = "pi"
 command = ["pi"]
 model = "anthropic/claude-opus-4-6:high"
+
+[firewall]
+# The single egress allowlist applied to every bridge run. There is no per-spec [firewall], no
+# hardcoded minimum, and no separate installer-only domain set; a bridge run whose resolved
+# allowlist is empty fails explicitly at `run start`.
+allow = ["api.github.com", "github.com", "crates.io", "packages.example.com"]
 ```
+
+## Network and firewall are global-only
+
+`sandbox.network` (`none`/`bridge`) and the egress allowlist are configured only in
+`<root>/config.toml`; a spec cannot declare `[firewall]` and `spec add` rejects one that does, and
+Gardr no longer ships a hardcoded minimum allowlist or a separate installer-domain set — every
+tool install runs against the same single `[firewall] allow` list as the harness. A spec's own
+`[sandbox] network`, and `run start --network`, may only *narrow* the global default to `"none"`;
+neither can force `bridge`, which is the global config's decision alone. Left unset everywhere, a
+run resolves to `none`. A bridge run whose global config has no (or an empty) `[firewall] allow`
+fails explicitly at `run start` rather than starting with open or empty egress. The resolved
+network mode and firewall allowlist are frozen into the run record at `run start`, exactly like the
+four layered runtime keys; `run resume` reuses them verbatim and never re-reads the global config.
+A stored spec that still declares `[firewall]` or `[[tools.install]].allow` fails to load with a
+clear error naming the removed key, not a silent ignore.
+
+Pi and OpenAI-Codex provider API domains implied by the effective `model` (`api.anthropic.com`, or
+`api.openai.com`/`chatgpt.com`) are added to bridge egress automatically, in addition to the global
+allowlist — an operator never has to list them by hand.
 
 A spec no longer has to set `image` or `harness.model` (or, for that matter, `workspace` or
 `harness.adapter`/`harness.command`): whatever a layer leaves unset, the next layer down supplies.
@@ -366,7 +403,9 @@ version = 1
 # of them the global config or `run start` flags supply, this spec doesn't need to repeat.
 
 [sandbox]
-network = "none" # or "bridge" for Gardr's allowlisted egress firewall
+# Optional: may only narrow the global config's network default to "none". Omit this to use
+# whatever the global config (or `run start --network none`) resolves.
+network = "none"
 
 [harness]
 adapter = "pi"          # the only supported adapter today; see note below
@@ -385,14 +424,11 @@ read_only = true
 # (defaulting to `name`), so one registered secret can be reused under several names.
 environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat" }]
 
-[firewall]
-allow = ["packages.example.com"]
-
+# Firewall policy lives only in the global config now; a spec cannot declare [firewall].
 [[tools.install]]
 name = "go"
 check = "go"
 install = [["asdf", "plugin", "add", "golang"], ["asdf", "install", "golang", "latest"], ["asdf", "set", "-u", "golang", "latest"]]
-allow = ["go.dev", "storage.googleapis.com"]
 ```
 
 An image profile is host-owned policy and declares a single source, its supported harnesses, and the
@@ -430,13 +466,16 @@ time. Use `pi` with an Anthropic model instead.
 Pi requires a provider-qualified `harness.model`; Gardr injects it as `--model`. It bootstraps the
 managed `<root>/pi/agent/` directory from only host `~/.pi/agent/auth.json`, mounts that at
 `/pi-agent`, and sets `PI_CODING_AGENT_DIR`; it never mounts the host Pi directory. The initial
-supported providers are `anthropic` and `openai-codex`, whose API domains are added to bridge egress.
+supported providers are `anthropic` and `openai-codex`, whose API domains are added to bridge
+egress automatically alongside the global `[firewall] allow` list (see "Network and firewall are
+global-only" above).
 
-Bridge runs get Gardr's minimum firewall allowlist plus `[firewall].allow`. Gardr resolves and pins
-each allowed address, allows tool-specific egress only while a missing tool is installed, then
-reapplies the runtime policy before starting the harness. The image must provide the Gardr agent
-runtime contract: `iptables`, `ipset`, `dig`, `sudo`, and an entrypoint that fails closed when
-`/usr/local/bin/init-firewall.sh` fails.
+Bridge runs apply exactly the global config's `[firewall] allow` list plus those implied provider
+domains: there is no hardcoded minimum, no separate maximum, and no separate installer-only domain
+set. Gardr resolves and pins each allowed address, then reapplies the same policy before starting
+the harness (a missing tool's install commands run before the firewall locks down for the harness
+itself). The image must provide the Gardr agent runtime contract: `iptables`, `ipset`, `dig`,
+`sudo`, and an entrypoint that fails closed when `/usr/local/bin/init-firewall.sh` fails.
 
 ## Workspace and lifecycle
 
