@@ -503,7 +503,7 @@ impl Store {
                         serde_json::to_vec_pretty(&ResolvedConfig::from_spec(&record, &spec, self))
                             .map_err(|error| error.to_string())?;
                     write_new(&directory.join("resolved.json"), &resolved)?;
-                    write_bootstrap(&directory, &spec)?;
+                    write_bootstrap(&directory, &spec, &record.effective.firewall_allow.value)?;
                     save_record(&directory, &record)?;
                     image
                 }
@@ -603,8 +603,6 @@ pub struct Spec {
     #[serde(default)]
     pub credentials: Credentials,
     #[serde(default)]
-    pub firewall: Firewall,
-    #[serde(default)]
     pub tools: Tooling,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -631,12 +629,16 @@ pub struct ImageSource {
     #[serde(default)]
     pub build_context: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sandbox {
-    pub network: Network,
+    /// A spec may only ever *narrow* the globally configured network mode to `none`; it cannot
+    /// request `bridge` itself (`bridge` is decided solely by the global config). Absent, the
+    /// global config's (or `run start --network none`'s) resolution applies unchanged.
+    #[serde(default)]
+    pub network: Option<Network>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Network {
     None,
@@ -706,6 +708,23 @@ pub struct GlobalConfig {
     pub image: Option<String>,
     #[serde(default)]
     pub harness: Option<GlobalHarness>,
+    /// The default sandbox network mode for every run. A spec's `sandbox.network` and
+    /// `run start --network` may only narrow this to `none`; neither can force `bridge`. Unset
+    /// everywhere, a run resolves to `none` (the safe default): bridge egress is never granted
+    /// by omission.
+    #[serde(default)]
+    pub network: Option<Network>,
+    /// The single global egress allowlist applied to every bridge run; there is no per-spec
+    /// `[firewall]` and no separate hardcoded minimum or installer-only list. A bridge run whose
+    /// resolved allowlist is empty fails explicitly at `run start`.
+    #[serde(default)]
+    pub firewall: Option<GlobalFirewall>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalFirewall {
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -722,21 +741,32 @@ pub struct GlobalHarness {
     pub model: Option<String>,
 }
 pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
-    toml::from_str(
+    let global: GlobalConfig = toml::from_str(
         std::str::from_utf8(content)
             .map_err(|error| format!("global config is not UTF-8: {error}"))?,
     )
-    .map_err(|error| format!("invalid global config: {error}"))
+    .map_err(|error| format!("invalid global config: {error}"))?;
+    for domain in global
+        .firewall
+        .iter()
+        .flat_map(|firewall| firewall.allow.iter())
+    {
+        validate_domain(domain)?;
+    }
+    Ok(global)
 }
 
-/// The `run start` command-line overrides for the four layered runtime keys. Each, if present,
-/// wins over the spec and global config layers for that key.
+/// The `run start` command-line overrides for the layered runtime keys. Each, if present, wins
+/// over the spec and global config layers for that key.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeOverrides {
     pub workspace: Option<String>,
     pub image: Option<String>,
     pub harness: Option<String>,
     pub model: Option<String>,
+    /// `--network none`: forces the resolved network to `none` regardless of the spec or global
+    /// config. There is no CLI way to force `bridge`; that is the global config's decision alone.
+    pub network_none: bool,
 }
 
 /// Which layer supplied a resolved runtime value.
@@ -766,6 +796,11 @@ pub struct EffectiveRuntime {
     pub harness: Resolved<Adapter>,
     pub model: Resolved<String>,
     pub harness_command: Resolved<Vec<String>>,
+    pub network: Resolved<Network>,
+    /// The global config's `[firewall] allow` list, frozen exactly as read at `run start`. This
+    /// is the single egress allowlist; `resume` reuses this value verbatim and never re-reads the
+    /// global config.
+    pub firewall_allow: Resolved<Vec<String>>,
 }
 
 /// Merges one required layered key: CLI overrides the spec, which overrides the global config.
@@ -788,6 +823,25 @@ fn merge_required(
     Err(format!(
         "missing required configuration key `{key}`: checked cli, spec, and global layers"
     ))
+}
+/// Merges the sandbox network mode: `run start --network none` or a spec's `sandbox.network =
+/// "none"` force the network off; neither can force `bridge`, which is decided solely by the
+/// global config. Falls back to `none` (the safe default) when nothing sets it.
+fn merge_network(
+    cli_none: bool,
+    spec: Option<Network>,
+    global: Option<Network>,
+) -> (Network, Layer) {
+    if cli_none {
+        return (Network::None, Layer::Cli);
+    }
+    if let Some(Network::None) = spec {
+        return (Network::None, Layer::Spec);
+    }
+    if let Some(network) = global {
+        return (network, Layer::Global);
+    }
+    (Network::None, Layer::Default)
 }
 /// Merges `harness.command`: spec overrides global config; there is no CLI override. Falls back
 /// to the resolved adapter's built-in default when neither layer sets it.
@@ -849,6 +903,23 @@ fn resolve_runtime(
             .filter(|command| !command.is_empty()),
         adapter,
     );
+    let (network, network_source) = merge_network(
+        overrides.network_none,
+        spec.and_then(|spec| spec.sandbox.network),
+        global.network,
+    );
+    let firewall_allow = global
+        .firewall
+        .as_ref()
+        .map(|firewall| firewall.allow.clone())
+        .unwrap_or_default();
+    if matches!(network, Network::Bridge) && firewall_allow.is_empty() {
+        return Err(
+            "missing required configuration: a bridge run requires a non-empty global config \
+             `[firewall] allow` list; gardr ships no hardcoded minimum allowlist"
+                .to_owned(),
+        );
+    }
     Ok(EffectiveRuntime {
         workspace: Resolved {
             value: workspace.0,
@@ -870,35 +941,47 @@ fn resolve_runtime(
             value: harness_command.0,
             source: harness_command.1,
         },
+        network: Resolved {
+            value: network,
+            source: network_source,
+        },
+        firewall_allow: Resolved {
+            value: firewall_allow,
+            source: Layer::Global,
+        },
     })
 }
 /// The neutral baseline used when a run has no spec at all: no image/harness/model of its own (all
-/// filled in by `apply_effective_runtime`), no mounts/credentials/tools, and network `none` since
-/// firewall policy has no layering of its own yet (a later ticket moves it to global-only config).
+/// filled in by `apply_effective_runtime`), no mounts/credentials/tools, and no network of its own
+/// (also filled in by `apply_effective_runtime` from the merged, global-only network mode).
 fn implicit_spec() -> Spec {
     Spec {
         version: 1,
         workspace: None,
         image: Image::default(),
-        sandbox: Sandbox {
-            network: Network::None,
-        },
+        sandbox: Sandbox { network: None },
         harness: Harness::default(),
         mounts: Vec::new(),
         credentials: Credentials::default(),
-        firewall: Firewall::default(),
         tools: Tooling::default(),
     }
 }
 /// Overwrites a baseline spec's layered fields (`image.name`, `harness.adapter`,
-/// `harness.command`, `harness.model`) with the merged effective values, leaving every unlayered
-/// field (sandbox, mounts, credentials, firewall, tools) exactly as the baseline declared it.
+/// `harness.command`, `harness.model`, `sandbox.network`) with the merged effective values,
+/// leaving every unlayered field (mounts, credentials, tools) exactly as the baseline declared it.
 fn apply_effective_runtime(mut spec: Spec, effective: &EffectiveRuntime) -> Spec {
     spec.image.name = Some(effective.image.value.clone());
     spec.harness.adapter = Some(effective.harness.value);
     spec.harness.command = effective.harness_command.value.clone();
     spec.harness.model = Some(effective.model.value.clone());
+    spec.sandbox.network = Some(effective.network.value);
     spec
+}
+/// The resolved network mode of a spec that has already been merged via `apply_effective_runtime`.
+fn resolved_network(spec: &Spec) -> Network {
+    spec.sandbox
+        .network
+        .expect("network is resolved by apply_effective_runtime before use")
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -948,26 +1031,20 @@ impl CredentialRef {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Firewall {
-    #[serde(default)]
-    pub allow: Vec<String>,
-}
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Tooling {
     #[serde(default)]
     pub required: Vec<String>,
     #[serde(default)]
     pub install: Vec<Tool>,
 }
+/// Installer domains are no longer declared per-tool: an installer runs with the same single
+/// global `[firewall] allow` egress as the harness itself (see `gardr docs`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tool {
     pub name: String,
     pub check: String,
     pub install: Vec<Vec<String>>,
-    #[serde(default)]
-    pub allow: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1071,10 +1148,10 @@ struct ResolvedPiAgent {
     source: String,
     target: &'static str,
 }
+/// There is exactly one egress allowlist now: no separate "runtime" vs. "installer" domain set.
 #[derive(Serialize)]
 struct ResolvedFirewall {
-    runtime: Vec<String>,
-    effective: Vec<String>,
+    allow: Vec<String>,
 }
 #[derive(Serialize)]
 struct ResolvedMount {
@@ -1113,8 +1190,7 @@ impl<'a> ResolvedConfig<'a> {
                 .collect(),
             credentials: &spec.credentials,
             firewall: ResolvedFirewall {
-                runtime: runtime_domains(spec),
-                effective: installer_domains(spec),
+                allow: runtime_domains(spec, &record.effective.firewall_allow.value),
             },
             tools: &spec.tools,
             pi_agent: matches!(spec.harness.adapter, Some(Adapter::Pi)).then(|| ResolvedPiAgent {
@@ -1126,10 +1202,40 @@ impl<'a> ResolvedConfig<'a> {
 }
 
 pub fn parse_spec(content: &[u8]) -> Result<Spec> {
-    toml::from_str(
-        std::str::from_utf8(content).map_err(|error| format!("run spec is not UTF-8: {error}"))?,
-    )
-    .map_err(|error| format!("invalid run spec: {error}"))
+    let text =
+        std::str::from_utf8(content).map_err(|error| format!("run spec is not UTF-8: {error}"))?;
+    let raw: toml::Value =
+        toml::from_str(text).map_err(|error| format!("invalid run spec: {error}"))?;
+    reject_removed_spec_keys(&raw)?;
+    toml::from_str(text).map_err(|error| format!("invalid run spec: {error}"))
+}
+/// Firewall policy moved to the global config only: a spec's `[firewall]` and
+/// `[[tools.install]].allow` are removed keys, not fields silently dropped by
+/// `deny_unknown_fields`'s generic message. Named explicitly so a stored spec written before this
+/// change fails clearly instead of with a bare "unknown field" error.
+fn reject_removed_spec_keys(raw: &toml::Value) -> Result<()> {
+    if raw.get("firewall").is_some() {
+        return Err(
+            "spec `[firewall]` is no longer supported: firewall policy is configured only in \
+             the global config's `[firewall] allow` now; remove `[firewall]` from this spec (see \
+             `gardr docs`)"
+                .to_owned(),
+        );
+    }
+    let declares_install_allow = raw
+        .get("tools")
+        .and_then(|tools| tools.get("install"))
+        .and_then(|install| install.as_array())
+        .is_some_and(|installs| installs.iter().any(|tool| tool.get("allow").is_some()));
+    if declares_install_allow {
+        return Err(
+            "spec `[[tools.install]].allow` is no longer supported: installer egress comes only \
+             from the global config's `[firewall] allow` now; remove `allow` from each \
+             `[[tools.install]]` entry (see `gardr docs`)"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 pub fn parse_image_profile(content: &[u8]) -> Result<ImageProfile> {
     toml::from_str(
@@ -1237,15 +1343,12 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
             ));
         }
     }
-    let mut domains = BTreeSet::new();
-    for domain in spec
-        .firewall
-        .allow
-        .iter()
-        .chain(spec.tools.install.iter().flat_map(|tool| tool.allow.iter()))
-    {
-        validate_domain(domain)?;
-        domains.insert(domain);
+    if matches!(spec.sandbox.network, Some(Network::Bridge)) {
+        return Err(
+            "a spec's sandbox.network may only override the global config to 'none'; 'bridge' is \
+             decided solely by the global config's network default"
+                .to_owned(),
+        );
     }
     let mut required_tools = BTreeSet::new();
     for tool in &spec.tools.required {
@@ -1267,9 +1370,6 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         for command in &tool.install {
             validate_command("tool install command", command)?;
         }
-    }
-    if !spec.tools.install.is_empty() && matches!(spec.sandbox.network, Network::None) {
-        return Err("tools require sandbox.network = 'bridge'".to_owned());
     }
     Ok(())
 }
@@ -1380,12 +1480,23 @@ fn validate_resolved_harness(harness: &Harness) -> Result<()> {
     }
     Ok(())
 }
+/// A resolved network of `none` cannot install tools: there is no egress to run installer
+/// commands over. Checked against the *merged* network (spec/CLI override applied over the
+/// global default), since a spec declaring `tools.install` may leave `sandbox.network` unset and
+/// rely on the global config resolving to `bridge`.
+fn validate_resolved_network(spec: &Spec) -> Result<()> {
+    if !spec.tools.install.is_empty() && matches!(resolved_network(spec), Network::None) {
+        return Err("tools require the resolved sandbox network to be 'bridge'".to_owned());
+    }
+    Ok(())
+}
 /// Runs every validation formerly performed only at `spec add` — supported adapter, image profile
 /// provides the harness, provider-qualified model, `tools.required` satisfied by the image —
 /// against the merged result, plus the spec's own unlayered runtime dependencies (mounts, managed
 /// Pi authentication). Called at `run start`/`run resume`, never at `spec add`.
 fn validate_resolved_spec(store: &Store, spec: &Spec) -> Result<()> {
     validate_resolved_harness(&spec.harness)?;
+    validate_resolved_network(spec)?;
     validate_runtime_spec(store, spec)?;
     validate_image_requirements(store, spec)?;
     Ok(())
@@ -1476,6 +1587,7 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn docker_arguments(
     store: &Store,
     spec: &Spec,
@@ -1494,7 +1606,7 @@ fn docker_arguments(
         "--name".to_owned(),
         format!("gardr-{spec_name}-{run_id}"),
         "--network".to_owned(),
-        match spec.sandbox.network {
+        match resolved_network(spec) {
             Network::None => "none",
             Network::Bridge => "bridge",
         }
@@ -1502,7 +1614,7 @@ fn docker_arguments(
         "--mount".to_owned(),
         format!("type=bind,source={},target=/workspace", workspace.display()),
     ];
-    if matches!(spec.sandbox.network, Network::Bridge) {
+    if matches!(resolved_network(spec), Network::Bridge) {
         args.extend([
             "--cap-add".to_owned(),
             "NET_ADMIN".to_owned(),
@@ -1582,7 +1694,7 @@ fn docker_arguments(
         args.extend(["--env-file".to_owned(), env_file.display().to_string()]);
     }
     args.push(image.to_owned());
-    if matches!(spec.sandbox.network, Network::Bridge) {
+    if matches!(resolved_network(spec), Network::Bridge) {
         args.extend([
             "sh".to_owned(),
             "/gardr/tool-bootstrap.sh".to_owned(),
@@ -1611,28 +1723,20 @@ fn docker_arguments(
     Ok(args)
 }
 
-const FIREWALL_MINIMUM: &[&str] = &[
-    "api.anthropic.com",
-    "api.github.com",
-    "claude.ai",
-    "crates.io",
-    "github.com",
-    "index.crates.io",
-    "registry.npmjs.org",
-    "static.crates.io",
-    "static.rust-lang.org",
-];
-
-fn runtime_domains(spec: &Spec) -> Vec<String> {
-    FIREWALL_MINIMUM
+/// Gardr ships no hardcoded minimum allowlist and has no separate maximum: the effective bridge
+/// egress policy is exactly the global config's `[firewall] allow` list, frozen into
+/// `effective.firewall_allow` at `run start`, plus the provider domains the resolved model implies
+/// (see `pi_runtime_domains`). Installer egress (tool installs) uses this same single list; there
+/// is no separate installer-only domain set.
+fn runtime_domains(spec: &Spec, firewall_allow: &[String]) -> Vec<String> {
+    firewall_allow
         .iter()
-        .map(|domain| (*domain).to_owned())
+        .cloned()
         .chain(
             pi_runtime_domains(spec)
                 .iter()
                 .map(|domain| (*domain).to_owned()),
         )
-        .chain(spec.firewall.allow.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1722,22 +1826,8 @@ fn sync_pi_auth_from(store: &Store, source: PathBuf) -> Result<()> {
     set_private_file(&destination)
 }
 
-fn installer_domains(spec: &Spec) -> Vec<String> {
-    runtime_domains(spec)
-        .into_iter()
-        .chain(
-            spec.tools
-                .install
-                .iter()
-                .flat_map(|tool| tool.allow.iter().cloned()),
-        )
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn write_bootstrap(directory: &Path, spec: &Spec) -> Result<()> {
-    if matches!(spec.sandbox.network, Network::None) {
+fn write_bootstrap(directory: &Path, spec: &Spec, firewall_allow: &[String]) -> Result<()> {
+    if matches!(resolved_network(spec), Network::None) {
         return Ok(());
     }
     let firewall = directory.join("firewall-init.sh");
@@ -1745,7 +1835,7 @@ fn write_bootstrap(directory: &Path, spec: &Spec) -> Result<()> {
     set_executable(&firewall)?;
     write_new(
         &directory.join("runtime-domains.txt"),
-        runtime_domains(spec).join("\n").as_bytes(),
+        runtime_domains(spec, firewall_allow).join("\n").as_bytes(),
     )?;
     let mut script = String::from("#!/bin/sh\nset -eu\n");
     for tool in &spec.tools.install {
@@ -2428,27 +2518,20 @@ mod tests {
 
     #[test]
     fn bridge_specs_resolve_tool_installer_egress_and_bootstrap() {
-        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['runtime.example']\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['install.example']\n").unwrap();
+        // A spec never declares [firewall] or tools.install.allow anymore; both are removed keys.
+        // sandbox.network is left unset here and manually set to Bridge below to simulate the
+        // merged, global-only resolution that `apply_effective_runtime` performs at `run start`.
+        let mut spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
         validate_spec(&spec).unwrap();
+        spec.sandbox.network = Some(Network::Bridge);
+        let firewall_allow = vec!["runtime.example".to_owned()];
         assert_eq!(
-            runtime_domains(&spec),
-            vec![
-                "api.anthropic.com",
-                "api.github.com",
-                "claude.ai",
-                "crates.io",
-                "github.com",
-                "index.crates.io",
-                "registry.npmjs.org",
-                "runtime.example",
-                "static.crates.io",
-                "static.rust-lang.org",
-            ]
+            runtime_domains(&spec, &firewall_allow),
+            vec!["api.anthropic.com", "runtime.example"]
         );
-        assert!(installer_domains(&spec).contains(&"install.example".to_owned()));
 
         let temp = temporary_directory();
-        write_bootstrap(&temp, &spec).unwrap();
+        write_bootstrap(&temp, &spec, &firewall_allow).unwrap();
         assert!(temp.join("firewall-init.sh").is_file());
         assert!(temp.join("runtime-domains.txt").is_file());
         assert!(
@@ -2488,29 +2571,29 @@ mod tests {
 
     #[test]
     fn pi_adapter_requires_a_supported_qualified_model() {
-        let valid = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'openai-codex/gpt-5.5:high'\n").unwrap();
+        let valid = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'openai-codex/gpt-5.5:high'\n").unwrap();
         validate_spec(&valid).unwrap();
-        assert!(runtime_domains(&valid).contains(&"api.openai.com".to_owned()));
-        assert!(runtime_domains(&valid).contains(&"chatgpt.com".to_owned()));
+        assert!(runtime_domains(&valid, &[]).contains(&"api.openai.com".to_owned()));
+        assert!(runtime_domains(&valid, &[]).contains(&"chatgpt.com".to_owned()));
 
         // A spec no longer has to set harness.model itself: it may be deferred to the global
         // config or `run start --model`. `validate_spec` (spec add) only validates a model that
         // IS present; requiring one to be present after merging is `validate_resolved_harness`'s
         // job, exercised in the layered-config resolution tests.
-        let missing_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
+        let missing_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\n").unwrap();
         assert!(validate_spec(&missing_model).is_ok());
         assert!(
             validate_resolved_harness(&missing_model.harness)
                 .unwrap_err()
                 .contains("model")
         );
-        let print_mode = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        let print_mode = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi', '-p']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(
             validate_spec(&print_mode)
                 .unwrap_err()
                 .contains("dispatch or model-selection")
         );
-        let overridden_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
+        let overridden_model = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--model=other']\nmodel = 'anthropic/claude-opus-4-6'\n").unwrap();
         assert!(validate_spec(&overridden_model).is_err());
         assert!(validate_dispatch_harness_args(&valid, &["--model=other".to_owned()]).is_err());
     }
@@ -2526,6 +2609,7 @@ mod tests {
                 model: Some("anthropic/global-model".to_owned()),
             }),
             spec: Some("global-spec".to_owned()),
+            ..Default::default()
         };
         let spec = parse_spec(b"version = 1\nworkspace = '/spec/workspace'\n[image]\nname = 'spec-image'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--spec-flag']\nmodel = 'anthropic/spec-model'\n").unwrap();
 
@@ -2549,6 +2633,7 @@ mod tests {
             image: Some("cli-image".to_owned()),
             harness: None,
             model: Some("anthropic/cli-model".to_owned()),
+            ..Default::default()
         };
         let merged = resolve_runtime(&global, Some(&spec), &overrides).unwrap();
         assert_eq!(merged.workspace.value, "/cli/workspace");
@@ -2632,7 +2717,9 @@ mod tests {
         assert_eq!(record.effective.image.source, Layer::Global);
         assert_eq!(record.effective.harness.source, Layer::Global);
         assert_eq!(record.effective.model.source, Layer::Global);
-        assert!(matches!(spec.sandbox.network, Network::None));
+        assert!(matches!(spec.sandbox.network, Some(Network::None)));
+        assert_eq!(record.effective.network.value, Network::None);
+        assert_eq!(record.effective.network.source, Layer::Default);
         assert!(!directory_has_spec_toml(&store, &record.id));
 
         let reloaded = store.read_run(&record.id).unwrap();
@@ -2682,12 +2769,15 @@ mod tests {
             .create_run(overrides_for(&workspace), Some("build"), vec![])
             .unwrap();
         assert_eq!(record.effective.model.value, "anthropic/claude-opus-4-6");
+        assert_eq!(record.effective.network.value, Network::None);
+        assert_eq!(record.effective.firewall_allow.value, Vec::<String>::new());
 
-        // Simulate the global config changing after the run was created; `resume` must not
-        // pick up the new value, since it never re-merges the layers.
+        // Simulate the global config changing after the run was created — including flipping to
+        // bridge with a firewall allowlist — `resume` must not pick up any of it, since it never
+        // re-merges the layers.
         fs::write(
             store.config_path(),
-            "[harness]\nmodel = 'anthropic/a-different-model'\n",
+            "network = 'bridge'\n[firewall]\nallow = ['packages.example.com']\n[harness]\nmodel = 'anthropic/a-different-model'\n",
         )
         .unwrap();
 
@@ -2706,6 +2796,8 @@ mod tests {
 
         let resumed = store.resume(&record.id).unwrap();
         assert_eq!(resumed.effective.model.value, "anthropic/claude-opus-4-6");
+        assert_eq!(resumed.effective.network.value, Network::None);
+        assert_eq!(resumed.effective.firewall_allow.value, Vec::<String>::new());
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -2926,19 +3018,115 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_firewall_and_offline_tool_specs() {
-        let malformed = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'bridge'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['not/a-domain']\n").unwrap();
+    fn rejects_removed_firewall_keys_and_offline_tool_installs() {
+        // A spec's `[firewall]` is a removed key, named clearly rather than a generic
+        // "unknown field" or silent ignore.
+        let malformed = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['not/a-domain']\n").unwrap_err();
+        assert!(malformed.contains("[firewall]"), "{malformed}");
+
+        // `[[tools.install]].allow` is likewise removed, named clearly.
+        let removed_install_allow = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\nallow = ['go.dev']\n").unwrap_err();
         assert!(
-            validate_spec(&malformed)
-                .unwrap_err()
-                .contains("invalid firewall domain")
+            removed_install_allow.contains("tools.install"),
+            "{removed_install_allow}"
         );
+
+        // A `tools.install` spec whose resolved network is `none` (no bridge egress to install
+        // over) is rejected once the network is merged, not before (a spec may leave network
+        // unset and rely on the global config resolving to bridge).
         let offline_tool = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[[tools.install]]\nname = 'go'\ncheck = 'go'\ninstall = [['asdf', 'install', 'golang', 'latest']]\n").unwrap();
+        validate_spec(&offline_tool).unwrap();
+        let mut merged = offline_tool.clone();
+        merged.sandbox.network = Some(Network::None);
         assert!(
-            validate_spec(&offline_tool)
+            validate_resolved_network(&merged)
                 .unwrap_err()
                 .contains("tools require")
         );
+    }
+
+    #[test]
+    fn spec_add_rejects_firewall_and_installer_allow_declarations() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[firewall]\nallow = ['packages.example.com']\n").unwrap();
+        let error = store.add_spec("build", &source).unwrap_err();
+        assert!(error.contains("[firewall]"), "{error}");
+        assert!(!store.spec_path("build").unwrap().exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn bridge_run_requires_a_non_empty_global_firewall_allowlist() {
+        // Gardr ships no hardcoded minimum allowlist: a bridge run whose global config has no
+        // (or an empty) `[firewall] allow` fails explicitly, rather than starting with open or
+        // empty egress.
+        let base = GlobalConfig {
+            workspace: Some("/workspace".to_owned()),
+            image: Some("image".to_owned()),
+            harness: Some(GlobalHarness {
+                adapter: Some(Adapter::Pi),
+                model: Some("anthropic/claude-opus-4-6".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let empty_allowlist = GlobalConfig {
+            network: Some(Network::Bridge),
+            ..base.clone()
+        };
+        let error =
+            resolve_runtime(&empty_allowlist, None, &RuntimeOverrides::default()).unwrap_err();
+        assert!(error.contains("firewall"), "{error}");
+
+        let populated_allowlist = GlobalConfig {
+            network: Some(Network::Bridge),
+            firewall: Some(GlobalFirewall {
+                allow: vec!["packages.example.com".to_owned()],
+            }),
+            ..base
+        };
+        let effective =
+            resolve_runtime(&populated_allowlist, None, &RuntimeOverrides::default()).unwrap();
+        assert_eq!(effective.network.value, Network::Bridge);
+        assert_eq!(
+            effective.firewall_allow.value,
+            vec!["packages.example.com".to_owned()]
+        );
+    }
+
+    #[test]
+    fn network_and_firewall_are_global_only_and_narrowed_only_to_none() {
+        // A spec cannot force bridge; only `none` is an allowed spec-level override.
+        let global = GlobalConfig {
+            network: Some(Network::Bridge),
+            firewall: Some(GlobalFirewall {
+                allow: vec!["packages.example.com".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let none_override = Sandbox {
+            network: Some(Network::None),
+        };
+        let (network, source) = merge_network(false, none_override.network, global.network);
+        assert_eq!(network, Network::None);
+        assert_eq!(source, Layer::Spec);
+
+        // `run start --network none` beats even a spec override.
+        let (network, source) = merge_network(true, none_override.network, global.network);
+        assert_eq!(network, Network::None);
+        assert_eq!(source, Layer::Cli);
+
+        // With nothing overriding it, the global default (bridge) applies.
+        let (network, source) = merge_network(false, None, global.network);
+        assert_eq!(network, Network::Bridge);
+        assert_eq!(source, Layer::Global);
+
+        // Unset everywhere, network resolves to the safe default, `none`.
+        let (network, source) = merge_network(false, None, None);
+        assert_eq!(network, Network::None);
+        assert_eq!(source, Layer::Default);
     }
 
     #[test]
