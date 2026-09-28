@@ -402,9 +402,11 @@ version = 1
 # workspace, [image] name, and [harness] adapter/command/model are all optional here: whichever
 # of them the global config or `run start` flags supply, this spec doesn't need to repeat.
 
+# [sandbox] itself is optional; omit the whole table to use whatever the global config (or
+# `run start --network none`) resolves.
 [sandbox]
-# Optional: may only narrow the global config's network default to "none". Omit this to use
-# whatever the global config (or `run start --network none`) resolves.
+# Optional: may only narrow the global config's network default to "none". Omit this key (or the
+# whole table) to use whatever the global config (or `run start --network none`) resolves.
 network = "none"
 
 [harness]

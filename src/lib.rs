@@ -595,6 +595,7 @@ pub struct Spec {
     pub workspace: Option<String>,
     #[serde(default)]
     pub image: Image,
+    #[serde(default)]
     pub sandbox: Sandbox,
     #[serde(default)]
     pub harness: Harness,
@@ -2508,6 +2509,54 @@ mod tests {
     #[test]
     fn rejects_unapproved_spec_fields() {
         assert!(parse_spec(b"version=1\nextra=true\n[image]\nreference='x'\n[sandbox]\nnetwork='none'\n[harness]\nadapter='pi'\ncommand=['x']\n").is_err());
+    }
+
+    #[test]
+    fn spec_without_a_sandbox_table_loads_and_validates_like_an_empty_one() {
+        let without_table = parse_spec(
+            b"version = 1\n[image]\nname = 'example'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        validate_spec(&without_table).unwrap();
+        assert_eq!(without_table.sandbox.network, None);
+
+        let with_empty_table = parse_spec(
+            b"version = 1\n[image]\nname = 'example'\n[sandbox]\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        validate_spec(&with_empty_table).unwrap();
+        assert_eq!(with_empty_table.sandbox.network, None);
+    }
+
+    #[test]
+    fn spec_without_a_sandbox_table_still_resolves_network_from_global_config() {
+        let global = GlobalConfig {
+            workspace: Some("/workspace".to_owned()),
+            network: Some(Network::Bridge),
+            firewall: Some(GlobalFirewall {
+                allow: vec!["packages.example.com".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let spec = parse_spec(
+            b"version = 1\n[image]\nname = 'example'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        let effective =
+            resolve_runtime(&global, Some(&spec), &RuntimeOverrides::default()).unwrap();
+        assert_eq!(effective.network.value, Network::Bridge);
+        assert_eq!(effective.network.source, Layer::Global);
+    }
+
+    #[test]
+    fn spec_without_a_sandbox_table_still_rejects_bridge_when_declared() {
+        let mut spec = parse_spec(
+            b"version = 1\n[image]\nname = 'example'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        spec.sandbox.network = Some(Network::Bridge);
+        let error = validate_spec(&spec).unwrap_err();
+        assert!(error.contains("'bridge'"), "{error}");
     }
 
     #[test]
