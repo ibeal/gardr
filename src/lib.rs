@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 
 pub type Result<T> = std::result::Result<T, String>;
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
@@ -232,8 +231,9 @@ impl Store {
     ) -> Result<(RunRecord, Spec)> {
         validate_harness_args(&harness_args)?;
         let global = self.read_global_config()?;
-        let spec_name = spec_name.map(str::to_owned).or_else(|| global.spec.clone());
-        let (spec_source, identity, content) = match &spec_name {
+        // The CLI no longer accepts --spec. Loading one here remains only for resuming/testing
+        // legacy records through the library API; new command-line runs always use global policy.
+        let (spec_source, identity, content) = match spec_name {
             Some(name) => {
                 let (spec, identity, content) = self.read_spec(name)?;
                 (Some(spec), Some(identity), Some(content))
@@ -241,7 +241,11 @@ impl Store {
             None => (None, None, None),
         };
         let effective = resolve_runtime(&global, spec_source.as_ref(), &overrides)?;
-        let spec = apply_effective_runtime(spec_source.unwrap_or_else(implicit_spec), &effective);
+        let mut spec =
+            apply_effective_runtime(spec_source.unwrap_or_else(implicit_spec), &effective);
+        if identity.is_none() {
+            spec.credentials = global.credentials.clone();
+        }
         validate_dispatch_harness_args(&spec, &harness_args)?;
         sync_pi_auth(self, &spec)?;
         validate_resolved_spec(self, &spec)?;
@@ -605,6 +609,13 @@ pub struct Spec {
     pub credentials: Credentials,
     #[serde(default)]
     pub tools: Tooling,
+    /// Global-only command prefix and container mounts copied in after parsing. `serde(skip)`
+    /// keeps both unavailable to legacy spec files while allowing the established execution path
+    /// to carry the frozen global runtime policy.
+    #[serde(skip)]
+    pub startup_command: Vec<String>,
+    #[serde(skip)]
+    pub runtime_mounts: Vec<RuntimeMount>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -701,8 +712,8 @@ pub struct GlobalConfig {
     /// Default workspace path, overridden by a spec's `workspace` and by `run start --workspace`.
     #[serde(default)]
     pub workspace: Option<String>,
-    /// Default spec name, overridden by `run start --spec`.
-    #[serde(default)]
+    /// Removed compatibility field. A parsed config that declares it receives a migration error.
+    #[serde(default, skip)]
     pub spec: Option<String>,
     /// Default image profile name, overridden by a spec's `image.name` and `run start --image`.
     #[serde(default)]
@@ -720,6 +731,33 @@ pub struct GlobalConfig {
     /// resolved allowlist is empty fails explicitly at `run start`.
     #[serde(default)]
     pub firewall: Option<GlobalFirewall>,
+    /// Credential references injected into every run. Values still come from Gardr's private
+    /// credential registry; only names and optional aliases are configuration.
+    #[serde(default)]
+    pub credentials: Credentials,
+    /// Optional command placed between Gardr's firewall bootstrap and the harness command. This is
+    /// useful for image-independent wrappers such as `nix develop --command`.
+    #[serde(default)]
+    pub startup_command: Vec<String>,
+    /// Trusted, global container mounts. They are deliberately not accepted from legacy specs.
+    #[serde(default)]
+    pub mounts: Vec<RuntimeMount>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMount {
+    #[serde(rename = "type")]
+    pub kind: RuntimeMountType,
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMountType {
+    Bind,
+    Volume,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -742,17 +780,68 @@ pub struct GlobalHarness {
     pub model: Option<String>,
 }
 pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
-    let global: GlobalConfig = toml::from_str(
-        std::str::from_utf8(content)
-            .map_err(|error| format!("global config is not UTF-8: {error}"))?,
-    )
-    .map_err(|error| format!("invalid global config: {error}"))?;
+    let text = std::str::from_utf8(content)
+        .map_err(|error| format!("global config is not UTF-8: {error}"))?;
+    let raw: toml::Value =
+        toml::from_str(text).map_err(|error| format!("invalid global config: {error}"))?;
+    if raw.get("spec").is_some() {
+        return Err("global config key `spec` has been removed; move runtime policy into config.toml and remove the key".to_owned());
+    }
+    let global: GlobalConfig =
+        toml::from_str(text).map_err(|error| format!("invalid global config: {error}"))?;
     for domain in global
         .firewall
         .iter()
         .flat_map(|firewall| firewall.allow.iter())
     {
         validate_domain(domain)?;
+    }
+    let mut credential_names = BTreeSet::new();
+    for reference in &global.credentials.environment {
+        validate_environment_reference(reference.env_name())?;
+        validate_name("credential registry key", reference.registry_key())?;
+        if !credential_names.insert(reference.env_name()) {
+            return Err(format!(
+                "duplicate credential environment name: {}",
+                reference.env_name()
+            ));
+        }
+    }
+    if !global.startup_command.is_empty() {
+        validate_command("startup command", &global.startup_command)?;
+    }
+    let mut mount_targets = BTreeSet::new();
+    for mount in &global.mounts {
+        validate_container_path("mount target", &mount.target)?;
+        if matches!(
+            mount.target.as_str(),
+            "/workspace"
+                | "/gardr"
+                | "/pi-agent"
+                | "/gardr-transcript"
+                | "/usr/local/bin/init-firewall.sh"
+        ) {
+            return Err(format!(
+                "mount target is reserved by Gardr: {}",
+                mount.target
+            ));
+        }
+        if !mount_targets.insert(&mount.target) {
+            return Err(format!("duplicate mount target: {}", mount.target));
+        }
+        match mount.kind {
+            RuntimeMountType::Volume => validate_name("Docker volume name", &mount.source)?,
+            RuntimeMountType::Bind => {
+                let source = Path::new(&mount.source);
+                if !source.is_absolute() {
+                    return Err(format!(
+                        "bind mount source must be absolute: {}",
+                        mount.source
+                    ));
+                }
+                validate_docker_path("bind mount source", source)?;
+            }
+        }
     }
     Ok(global)
 }
@@ -802,6 +891,17 @@ pub struct EffectiveRuntime {
     /// is the single egress allowlist; `resume` reuses this value verbatim and never re-reads the
     /// global config.
     pub firewall_allow: Resolved<Vec<String>>,
+    /// Global credential references frozen with the run. Values are resolved from the private
+    /// registry only when a container is launched. `None` is reserved for records created before
+    /// this field existed, whose frozen legacy spec remains authoritative.
+    #[serde(default)]
+    pub credentials: Option<Credentials>,
+    /// Global-only generic container policy. `None` preserves legacy records created before these
+    /// fields existed; new records always freeze `Some`, including an empty value.
+    #[serde(default)]
+    pub startup_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub mounts: Option<Vec<RuntimeMount>>,
 }
 
 /// Merges one required layered key: CLI overrides the spec, which overrides the global config.
@@ -950,6 +1050,13 @@ fn resolve_runtime(
             value: firewall_allow,
             source: Layer::Global,
         },
+        credentials: Some(
+            spec.map(|spec| spec.credentials.clone())
+                .filter(|credentials| !credentials.environment.is_empty())
+                .unwrap_or_else(|| global.credentials.clone()),
+        ),
+        startup_command: Some(global.startup_command.clone()),
+        mounts: Some(global.mounts.clone()),
     })
 }
 /// The neutral baseline used when a run has no spec at all: no image/harness/model of its own (all
@@ -965,6 +1072,8 @@ fn implicit_spec() -> Spec {
         mounts: Vec::new(),
         credentials: Credentials::default(),
         tools: Tooling::default(),
+        startup_command: Vec::new(),
+        runtime_mounts: Vec::new(),
     }
 }
 /// Overwrites a baseline spec's layered fields (`image.name`, `harness.adapter`,
@@ -976,6 +1085,15 @@ fn apply_effective_runtime(mut spec: Spec, effective: &EffectiveRuntime) -> Spec
     spec.harness.command = effective.harness_command.value.clone();
     spec.harness.model = Some(effective.model.value.clone());
     spec.sandbox.network = Some(effective.network.value);
+    if let Some(credentials) = &effective.credentials {
+        spec.credentials = credentials.clone();
+    }
+    if let Some(startup_command) = &effective.startup_command {
+        spec.startup_command = startup_command.clone();
+    }
+    if let Some(mounts) = &effective.mounts {
+        spec.runtime_mounts = mounts.clone();
+    }
     spec
 }
 /// The resolved network mode of a spec that has already been merged via `apply_effective_runtime`.
@@ -1622,6 +1740,8 @@ fn docker_arguments(
             "--env".to_owned(),
             "AP_AGENT_MODE=1".to_owned(),
             "--env".to_owned(),
+            "GARDR_AGENT_MODE=1".to_owned(),
+            "--env".to_owned(),
             "RUN_MANIFEST=/gardr/resolved.json".to_owned(),
             "--mount".to_owned(),
             format!(
@@ -1632,6 +1752,20 @@ fn docker_arguments(
             format!(
                 "type=bind,source={},target=/usr/local/bin/init-firewall.sh,readonly",
                 run_directory.join("firewall-init.sh").display()
+            ),
+        ]);
+    }
+    for mount in &spec.runtime_mounts {
+        let kind = match mount.kind {
+            RuntimeMountType::Bind => "bind",
+            RuntimeMountType::Volume => "volume",
+        };
+        let readonly = if mount.read_only { ",readonly" } else { "" };
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type={kind},source={},target={}{}",
+                mount.source, mount.target, readonly
             ),
         ]);
     }
@@ -1720,6 +1854,7 @@ fn docker_arguments(
         injected.push(format!("{PI_TRANSCRIPT_MOUNT}/session.jsonl"));
     }
     command.splice(1..1, injected);
+    args.extend(spec.startup_command.iter().cloned());
     args.extend(command);
     Ok(args)
 }
@@ -2840,7 +2975,7 @@ mod tests {
         save_record(&directory, &record).unwrap();
         write_new(&directory.join("resolved.json"), b"{}").unwrap();
 
-        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  run) echo 'fake-container'; exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n";
+        let script = "#!/bin/sh\nset -eu\ncase \"$1\" in\n  volume) echo 'volume-created'; exit 0 ;;\n  run) echo 'fake-container'; exit 0 ;;\n  *) echo \"unexpected docker command: $1\" >&2; exit 1 ;;\nesac\n";
         let _docker = FakeDocker::install(script, &temp.join("bin"));
 
         let resumed = store.resume(&record.id).unwrap();
@@ -2873,7 +3008,18 @@ mod tests {
 
     #[test]
     fn pi_docker_arguments_mount_managed_auth_and_select_model() {
-        let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
+        let mut spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
+        spec.startup_command = vec![
+            "nix".to_owned(),
+            "develop".to_owned(),
+            "--command".to_owned(),
+        ];
+        spec.runtime_mounts = vec![RuntimeMount {
+            kind: RuntimeMountType::Volume,
+            source: "shared-tools".to_owned(),
+            target: "/tool-cache".to_owned(),
+            read_only: false,
+        }];
         let temp = temporary_directory();
         let store = Store::open(temp.join("store"));
         let arguments = docker_arguments(
@@ -2917,6 +3063,23 @@ mod tests {
             arguments
                 .windows(2)
                 .any(|pair| pair == ["--session", "/gardr-transcript/session.jsonl"])
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "type=volume,source=shared-tools,target=/tool-cache")
+        );
+        assert!(
+            arguments
+                .windows(4)
+                .any(|arguments| arguments == ["nix", "develop", "--command", "pi"]),
+            "the global startup command must wrap the harness command"
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.ends_with("target=/nix")),
+            "Gardr must not inject Nix-specific mounts"
         );
         assert!(
             arguments
@@ -3615,7 +3778,7 @@ mod tests {
     #[test]
     fn launch_removes_credentials_env_after_docker_run_returns() {
         let temp = temporary_directory();
-        let script = "#!/bin/sh\nset -eu\nif [ \"$1\" = 'image' ] && [ \"$2\" = 'inspect' ]; then\n  if [ \"$3\" = '--format' ]; then\n    echo 'sha256:fakeid'\n  fi\n  exit 0\nfi\nif [ \"$1\" = 'run' ]; then\n  echo 'fake-container'\n  exit 0\nfi\necho \"unexpected docker command: $*\" >&2\nexit 1\n";
+        let script = "#!/bin/sh\nset -eu\nif [ \"$1\" = 'image' ] && [ \"$2\" = 'inspect' ]; then\n  if [ \"$3\" = '--format' ]; then\n    echo 'sha256:fakeid'\n  fi\n  exit 0\nfi\nif [ \"$1\" = 'volume' ]; then\n  echo \"volume-created\"\n  exit 0\nfi\nif [ \"$1\" = 'run' ]; then\n  echo 'fake-container'\n  exit 0\nfi\necho \"unexpected docker command: $*\" >&2\nexit 1\n";
         let _docker = FakeDocker::install(script, &temp.join("bin"));
 
         let store = Store::open(temp.join("store"));
@@ -3651,5 +3814,73 @@ mod tests {
             "credentials.env must not survive past docker run returning"
         );
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn removed_global_spec_key_has_a_migration_error() {
+        let error = parse_global_config(b"spec = 'build'\n").unwrap_err();
+        assert!(
+            error.contains("spec") && error.contains("removed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn global_credential_references_are_frozen_into_effective_runtime() {
+        let global = parse_global_config(
+            b"workspace = '/workspace'\nimage = 'example'\n[credentials]\nenvironment = [{ name = 'GH_TOKEN', from = 'github-read-only' }]\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        let effective = resolve_runtime(&global, None, &RuntimeOverrides::default()).unwrap();
+        let credentials = effective.credentials.unwrap();
+        assert_eq!(credentials.environment[0].env_name(), "GH_TOKEN");
+        assert_eq!(
+            credentials.environment[0].registry_key(),
+            "github-read-only"
+        );
+    }
+
+    #[test]
+    fn startup_command_and_mounts_are_global_generic_and_frozen() {
+        let global = parse_global_config(
+            b"workspace = '/workspace'\nimage = 'custom-agent'\nstartup_command = ['toolbox', 'enter', '--']\n[[mounts]]\ntype = 'volume'\nsource = 'shared-tools'\ntarget = '/tools'\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        let effective = resolve_runtime(&global, None, &RuntimeOverrides::default()).unwrap();
+        assert_eq!(
+            effective.startup_command.as_ref().unwrap(),
+            &["toolbox", "enter", "--"]
+        );
+        let mounts = effective.mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, "shared-tools");
+        assert_eq!(mounts[0].target, "/tools");
+    }
+
+    #[test]
+    fn global_mounts_reject_relative_binds_and_reserved_targets() {
+        let relative = parse_global_config(
+            b"[[mounts]]\ntype = 'bind'\nsource = 'relative/path'\ntarget = '/tools'\n",
+        )
+        .unwrap_err();
+        assert!(relative.contains("must be absolute"), "{relative}");
+
+        let reserved = parse_global_config(
+            b"[[mounts]]\ntype = 'volume'\nsource = 'shared-tools'\ntarget = '/workspace'\n",
+        )
+        .unwrap_err();
+        assert!(reserved.contains("reserved"), "{reserved}");
+    }
+
+    #[test]
+    fn runtime_is_not_nix_specific() {
+        let global = parse_global_config(
+            b"workspace = '/workspace'\nimage = 'plain-agent'\nnetwork = 'bridge'\n[firewall]\nallow = ['packages.example.com']\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        let effective = resolve_runtime(&global, None, &RuntimeOverrides::default()).unwrap();
+        assert_eq!(effective.image.value, "plain-agent");
+        assert!(effective.startup_command.unwrap().is_empty());
+        assert!(effective.mounts.unwrap().is_empty());
     }
 }
