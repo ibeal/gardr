@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use gardr::{Store, validate_workspace};
+use gardr::{StartRequest, Store, validate_workspace};
 
 fn main() {
     if let Err(error) = run() {
@@ -153,19 +153,32 @@ fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
                     ));
                 }
             };
+            if args.iter().any(|argument| argument == "--workspace") {
+                return Err(
+                    "--workspace has been removed; use --repo <path> (or --url <git-url>)"
+                        .to_owned(),
+                );
+            }
+            let request = StartRequest {
+                repo: checked_option(&mut args, "--repo")?.map(PathBuf::from),
+                url: checked_option(&mut args, "--url")?,
+                thread: checked_option(&mut args, "--thread")?,
+                ask_file: checked_option(&mut args, "--ask-file")?.map(PathBuf::from),
+                current_dir: env::current_dir().map_err(|error| error.to_string())?,
+            };
             let overrides = gardr::RuntimeOverrides {
-                workspace: option(&mut args, "--workspace"),
                 image: option(&mut args, "--image"),
                 harness: option(&mut args, "--harness"),
                 model: option(&mut args, "--model"),
                 network_none,
+                ..Default::default()
             };
             if option(&mut args, "--spec").is_some() {
                 return Err("--spec has been removed; configure runtime policy in <root>/config.toml and use deliberate CLI overrides only".to_owned());
             }
             let harness_args = options(&mut args, "--harness-arg");
             reject_extra(&args)?;
-            print_json(&store.start(overrides, None, harness_args)?)
+            print_json(&store.start_one_shot(request, overrides, harness_args)?)
         }
         "observe" => {
             let id = take(&mut args)?;
@@ -206,6 +219,16 @@ fn option(args: &mut Vec<String>, flag: &str) -> Option<String> {
             args.remove(index);
             (index < args.len()).then(|| args.remove(index))
         })
+}
+fn checked_option(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, String> {
+    let Some(index) = args.iter().position(|value| value == flag) else {
+        return Ok(None);
+    };
+    if index + 1 >= args.len() || args[index + 1].starts_with("--") {
+        return Err(format!("{flag} requires a value"));
+    }
+    args.remove(index);
+    Ok(Some(args.remove(index)))
 }
 fn options(args: &mut Vec<String>, flag: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -250,37 +273,33 @@ fn usage() -> String {
     HELP.trim_end().to_owned()
 }
 
-const HELP: &str = "Durable sandbox execution for prepared agent workspaces\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nThe removed `spec` command returns a migration error. Runtime policy belongs in config.toml.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
+const HELP: &str = "One-shot sandbox execution for agent repositories\n\nUsage: gardr [--root <path>] <COMMAND>\n\nCommands:\n  image      Manage named image profiles\n  run        Manage workspace runs\n  credential Manage the registered credential store\n  docs       Print built-in guidance and examples\n  help       Print this message\n\nThe removed `spec` command returns a migration error. Runtime policy belongs in config.toml.\n\nRoot:\n  ~/.gardr by default; GARDR_ROOT or --root overrides it\n";
 
 const SPEC_HELP: &str = "Per-spec runtime configuration has been removed. Move image, harness, model, credentials, network, and firewall policy to <root>/config.toml.\n";
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
-const RUN_HELP: &str = "Manage prepared workspace runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               [--workspace <path>] [--image <name>] [--harness <adapter>]\n                      [--model <name>] [--network none] [--harness-arg <arg>]...\n  observe             <run-id>\n  resume              <run-id>\n  stop                <run-id>\n  cleanup             <run-id>\n  validate-workspace  <path>\n\nRuntime policy comes from <root>/config.toml. CLI image/harness/model/workspace values deliberately\noverride it; --network none may only narrow egress. --spec has been removed. Generic startup_command\nand mounts settings are configured globally.\n";
+const RUN_HELP: &str = "Manage one-shot agent runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               [--repo <path> | --url <git-url>] [--thread <name>] [--ask-file <path>]\n                      [--image <name>] [--harness <adapter>] [--model <name>]\n                      [--network none] [--harness-arg <arg>]...\n  observe             <run-id>\n  resume              <interrupted-run-id>\n  stop                <run-id>\n  cleanup             <run-id>\n  validate-workspace  <path>\n\nWith no source option, start uses the current directory (or an existing thread's source). --url\ncreates a persistent checkout beneath the Gardr root. Interrupted runs resume their frozen source,\noriginal ask, and Pi transcript; successful runs are terminal. Runtime policy remains global.\n";
 
 const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   gardr credential set <name> --file <path> | --stdin\n  list  Print registered names as JSON\n  rm    Remove a registered value: <name>\n\nValues are never printed. Global config [credentials] entries select registry names and aliases.\n";
 
-const DOCS: &str = r#"# gardr — durable sandbox execution
+const DOCS: &str = r#"# gardr — one-shot sandbox execution
 
-Gardr runs prepared workspaces with runtime policy from `<root>/config.toml`. It does not prescribe
-how an image supplies its tools. The former spec layer and `--spec` are removed.
+`run start` selects the current directory by default, `--repo <path>` selects an existing checkout,
+and `--url <git-url>` creates a persistent clone under `<root>/workspaces`. Every source is mounted
+writable at `/repo`. `--ask-file <path>` copies an autonomous ask into the immutable run record.
+
+A named `--thread` binds a source to `<root>/threads/<name>/CONTINUITY.md`. Later fresh runs reuse
+that source and continuity file, but always get a new Pi transcript. An interrupted or unsuccessful
+run may resume its frozen source, original ask, and existing transcript; successful runs are
+terminal. Resume accepts no replacement source or ask.
+
+Runtime policy remains global in `<root>/config.toml`:
 
 ```toml
-workspace = "/workspaces/default"
 image = "my-agent"
 network = "bridge"
 startup_command = ["toolbox", "run", "--"]
-
-[[mounts]]
-type = "volume"
-source = "shared-tool-cache"
-target = "/tool-cache"
-
-[[mounts]]
-type = "bind"
-source = "/absolute/host/path"
-target = "/extra-input"
-read_only = true
 
 [harness]
 adapter = "pi"
@@ -294,14 +313,9 @@ environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat"
 allow = ["api.github.com", "github.com"]
 ```
 
-The optional `startup_command` prefixes the harness command. Global `mounts` pass named Docker
-volumes or absolute-path bind mounts to the container. Gardr does not inject Nix-specific mounts,
-caches, domains, or startup behavior. Images may bake in every tool, use Nix, or use another package
-manager. Image profiles and build contexts are user-owned under `<root>/images`.
-
-Provider API domains are inferred from the selected model. Credential values come only from
-Gardr's private registry. Run records freeze effective policy; resume never re-reads global
-configuration.
+Gardr supplies a shared `gardr-nix` volume at `/nix` and stable base instructions at
+`/gardr-context/AGENTS.md`. Source selection never changes image, model, credentials, mounts,
+network policy, or provider-domain inference. Image profiles remain under `<root>/images`.
 "#;
 
 fn root(
@@ -348,6 +362,19 @@ mod tests {
     fn help_documents_the_default_root_and_docs_command() {
         assert!(HELP.contains("~/.gardr by default"));
         assert!(HELP.contains("docs       Print built-in guidance"));
+    }
+
+    #[test]
+    fn source_options_require_values() {
+        let mut args = vec![
+            "--repo".to_owned(),
+            "--url".to_owned(),
+            "example".to_owned(),
+        ];
+        assert_eq!(
+            checked_option(&mut args, "--repo").unwrap_err(),
+            "--repo requires a value"
+        );
     }
 
     #[test]

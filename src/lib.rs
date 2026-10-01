@@ -29,6 +29,15 @@ impl Store {
     pub fn runs_path(&self) -> PathBuf {
         self.root.join("runs")
     }
+    pub fn workspaces_path(&self) -> PathBuf {
+        self.root.join("workspaces")
+    }
+    pub fn threads_path(&self) -> PathBuf {
+        self.root.join("threads")
+    }
+    pub fn base_context_path(&self) -> PathBuf {
+        self.root.join("agent").join("AGENTS.md")
+    }
     pub fn mounts_path(&self) -> PathBuf {
         self.root.join("mounts")
     }
@@ -223,6 +232,153 @@ impl Store {
         fs::remove_file(&path).map_err(io_error)
     }
 
+    pub fn start_one_shot(
+        &self,
+        request: StartRequest,
+        mut overrides: RuntimeOverrides,
+        harness_args: Vec<String>,
+    ) -> Result<RunRecord> {
+        if request.repo.is_some() && request.url.is_some() {
+            return Err("--repo and --url are mutually exclusive".to_owned());
+        }
+        if request.ask_file.is_some() && !harness_args.is_empty() {
+            return Err("--ask-file and --harness-arg are mutually exclusive".to_owned());
+        }
+        let ask = request
+            .ask_file
+            .as_ref()
+            .map(|path| {
+                fs::read(path)
+                    .map_err(|error| format!("unable to read ask file {}: {error}", path.display()))
+            })
+            .transpose()?;
+        if ask.as_ref().is_some_and(Vec::is_empty) {
+            return Err("ask file must not be empty".to_owned());
+        }
+        let thread = request
+            .thread
+            .as_deref()
+            .map(|name| self.resolve_thread(name))
+            .transpose()?
+            .flatten();
+        let source = match (request.repo, request.url, thread.as_ref()) {
+            (Some(path), None, _) => SourceRecord::directory(validate_workspace(&path)?),
+            (None, Some(url), _) => self.clone_source(&url)?,
+            (None, None, Some(thread)) => thread.source.clone(),
+            (None, None, None) => {
+                SourceRecord::directory(validate_workspace(&request.current_dir)?)
+            }
+            (Some(_), Some(_), _) => unreachable!(),
+        };
+        if let Some(name) = request.thread.as_deref() {
+            match thread {
+                Some(existing) if existing.source.path != source.path => {
+                    return Err(format!(
+                        "thread {name} is already bound to a different repository"
+                    ));
+                }
+                Some(_) => {}
+                None => self.create_thread(name, &source)?,
+            }
+        }
+        overrides.workspace = Some(source.path.clone());
+        let (mut record, spec) = self.create_run(overrides, None, harness_args)?;
+        record.version = 2;
+        record.source = Some(source);
+        record.thread = request.thread;
+        if let Some(thread) = record.thread.as_deref() {
+            write_new(
+                &self.run_path(&record.id)?.join("continuity.path"),
+                self.threads_path()
+                    .join(thread)
+                    .join("CONTINUITY.md")
+                    .display()
+                    .to_string()
+                    .as_bytes(),
+            )?;
+        }
+        if let Some(ask) = ask {
+            let input = self.run_path(&record.id)?.join("input.md");
+            write_new(&input, &ask)?;
+            record.input_path = Some(input.display().to_string());
+        }
+        ensure_base_context(self)?;
+        let directory = self.run_path(&record.id)?;
+        write_new(
+            &directory.join("metadata.json"),
+            &serde_json::to_vec_pretty(&OneShotMetadata {
+                version: record.version,
+                id: &record.id,
+                source: record.source.as_ref().expect("one-shot source is set"),
+                thread: record.thread.as_deref(),
+                input_path: record.input_path.as_deref(),
+                effective: &record.effective,
+                created_at: record.created_at,
+            })
+            .map_err(|error| error.to_string())?,
+        )?;
+        save_record(&directory, &record)?;
+        let repo = PathBuf::from(&record.workspace);
+        self.launch(record, repo, spec)
+    }
+
+    fn clone_source(&self, url: &str) -> Result<SourceRecord> {
+        if url.trim().is_empty() || url.contains(['\n', '\r', '\0']) {
+            return Err("invalid git URL".to_owned());
+        }
+        fs::create_dir_all(self.workspaces_path()).map_err(io_error)?;
+        let id = new_workspace_id();
+        let workspace = self.workspaces_path().join(&id);
+        fs::create_dir(&workspace).map_err(io_error)?;
+        let repo = workspace.join("repo");
+        let output = Command::new("git")
+            .args(["clone", "--", url])
+            .arg(&repo)
+            .output()
+            .map_err(io_error)?;
+        if !output.status.success() {
+            let _ = fs::remove_dir_all(&workspace);
+            return Err(command_error("git clone", &output));
+        }
+        Ok(SourceRecord {
+            kind: SourceKind::Url,
+            path: validate_workspace(&repo)?.display().to_string(),
+            url: Some(url.to_owned()),
+            workspace_id: Some(id),
+            workspace_path: Some(workspace.display().to_string()),
+        })
+    }
+
+    fn resolve_thread(&self, name: &str) -> Result<Option<ThreadRecord>> {
+        validate_name("thread name", name)?;
+        let path = self.threads_path().join(name).join("thread.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("invalid thread record: {error}"))
+    }
+
+    fn create_thread(&self, name: &str, source: &SourceRecord) -> Result<()> {
+        validate_name("thread name", name)?;
+        let directory = self.threads_path().join(name);
+        fs::create_dir_all(&directory).map_err(io_error)?;
+        write_new(
+            &directory.join("thread.json"),
+            &serde_json::to_vec_pretty(&ThreadRecord {
+                source: source.clone(),
+            })
+            .map_err(|error| error.to_string())?,
+        )?;
+        write_new(
+            &directory.join("CONTINUITY.md"),
+            b"# Continuity\n\n- Decisions:\n- Current state:\n- Verification:\n- Blockers:\n- Next work:\n",
+        )
+    }
+
     pub fn create_run(
         &self,
         overrides: RuntimeOverrides,
@@ -230,6 +386,7 @@ impl Store {
         harness_args: Vec<String>,
     ) -> Result<(RunRecord, Spec)> {
         validate_harness_args(&harness_args)?;
+        ensure_base_context(self)?;
         let global = self.read_global_config()?;
         // The CLI no longer accepts --spec. Loading one here remains only for resuming/testing
         // legacy records through the library API; new command-line runs always use global policy.
@@ -283,6 +440,10 @@ impl Store {
             stderr_path: directory.join("stderr.log").display().to_string(),
             usage: None,
             usage_error: None,
+            attempt: 1,
+            source: None,
+            thread: None,
+            input_path: None,
         };
         if let Some(content) = &content {
             write_new(&directory.join("spec.toml"), content)?;
@@ -308,6 +469,10 @@ impl Store {
 
     pub fn resume(&self, id: &str) -> Result<RunRecord> {
         let mut record = self.read_run(id)?;
+        let directory = self.run_path(id)?;
+        if directory.join("cleanup.complete").exists() {
+            return Err("cleaned runs are terminal and cannot be resumed".to_owned());
+        }
         if matches!(record.state, RunState::Running) {
             let container = record
                 .container
@@ -318,9 +483,17 @@ impl Store {
                     record.state = RunState::Stopped;
                     record.exit_status = exit_status;
                     record.updated_at = now();
-                    save_record(&self.run_path(id)?, &record)?;
+                    save_record(&directory, &record)?;
                 }
-                Some((true, _)) => {}
+                Some((true, _)) => {
+                    return Err(format!("run {id} is still running"));
+                }
+                None if record.source.is_some() => {
+                    record.state = RunState::Failed;
+                    record.failure = Some("container is no longer available".to_owned());
+                    record.updated_at = now();
+                    save_record(&directory, &record)?;
+                }
                 None => return Err("container is no longer available".to_owned()),
             }
         }
@@ -333,13 +506,14 @@ impl Store {
                 record.state
             ));
         }
-        let directory = self.run_path(id)?;
-        if directory.join("cleanup.complete").exists() {
-            return Err("cleaned runs are terminal and cannot be resumed".to_owned());
+        if record.source.is_some() && record.exit_status == Some(0) {
+            return Err(format!(
+                "run {id} completed successfully and is terminal; start a new run for a new ask"
+            ));
         }
-        // `resume` never re-merges the global/spec/CLI layers: it uses the frozen effective
-        // values recorded at `run start` and only reloads the frozen spec.toml (if any) for the
-        // static, unlayered fields (sandbox, mounts, credentials, firewall, tools).
+        // `resume` never re-merges global policy or accepts replacement source/input. It uses the
+        // frozen effective values, original input.md, and existing Pi transcript. Legacy records
+        // additionally reload their frozen spec for static unlayered fields.
         let workspace = validate_workspace(Path::new(&record.effective.workspace.value))?;
         let baseline = match &record.spec {
             Some(identity) => {
@@ -363,6 +537,9 @@ impl Store {
             return Err(
                 "run has incomplete resolved configuration and cannot be resumed".to_owned(),
             );
+        }
+        if record.source.is_some() {
+            prepare_one_shot_resume(&directory, &mut record)?;
         }
         self.launch(record, workspace, spec)
     }
@@ -390,6 +567,11 @@ impl Store {
                 Some((false, exit_status)) => {
                     record.state = RunState::Stopped;
                     record.exit_status = exit_status;
+                    if let Err(error) = capture_run_logs(&record) {
+                        append_log(&self.run_path(id)?, &format!("log capture failed: {error}"))?;
+                    }
+                    record.updated_at = now();
+                    save_record(&self.run_path(id)?, &record)?;
                 }
                 None => {
                     record.state = RunState::Failed;
@@ -816,7 +998,11 @@ pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
         if matches!(
             mount.target.as_str(),
             "/workspace"
+                | "/repo"
+                | "/nix"
                 | "/gardr"
+                | "/gardr-context"
+                | "/gardr-input"
                 | "/pi-agent"
                 | "/gardr-transcript"
                 | "/usr/local/bin/init-firewall.sh"
@@ -844,6 +1030,58 @@ pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
         }
     }
     Ok(global)
+}
+
+#[derive(Clone, Debug)]
+pub struct StartRequest {
+    pub repo: Option<PathBuf>,
+    pub url: Option<String>,
+    pub thread: Option<String>,
+    pub ask_file: Option<PathBuf>,
+    pub current_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceRecord {
+    pub kind: SourceKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+}
+impl SourceRecord {
+    fn directory(path: PathBuf) -> Self {
+        Self {
+            kind: SourceKind::Directory,
+            path: path.display().to_string(),
+            url: None,
+            workspace_id: None,
+            workspace_path: None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Directory,
+    Url,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ThreadRecord {
+    source: SourceRecord,
+}
+#[derive(Serialize)]
+struct OneShotMetadata<'a> {
+    version: u32,
+    id: &'a str,
+    source: &'a SourceRecord,
+    thread: Option<&'a str>,
+    input_path: Option<&'a str>,
+    effective: &'a EffectiveRuntime,
+    created_at: u64,
 }
 
 /// The `run start` command-line overrides for the layered runtime keys. Each, if present, wins
@@ -1218,6 +1456,16 @@ pub struct RunRecord {
     /// with `usage_error: None`). Computed live; never persisted to `state.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_error: Option<String>,
+    /// One-based process attempt within this run. Legacy records default to their first attempt.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+    /// Present for one-shot runs. Legacy resumable records omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_path: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HarnessUsage {
@@ -1444,8 +1692,11 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
             return Err(format!("duplicate mount name: {}", mount.name));
         }
         validate_container_path("mount target", &mount.target)?;
-        if mount.target == "/workspace" {
-            return Err("/workspace is reserved for the prepared workspace".to_owned());
+        if matches!(
+            mount.target.as_str(),
+            "/workspace" | "/repo" | "/nix" | "/gardr-context" | "/gardr-input"
+        ) {
+            return Err(format!("{} is reserved by Gardr", mount.target));
         }
         if !targets.insert(&mount.target) {
             return Err(format!("duplicate mount target: {}", mount.target));
@@ -1649,9 +1900,14 @@ fn verify_locked_mounts(store: &Store, spec: &Spec, directory: &Path) -> Result<
 }
 
 pub fn validate_workspace(path: &Path) -> Result<PathBuf> {
-    let workspace = path.canonicalize().map_err(io_error)?;
+    let workspace = path
+        .canonicalize()
+        .map_err(|error| format!("repository path {} is unavailable: {error}", path.display()))?;
     if !workspace.is_dir() {
-        return Err("workspace must be a directory".to_owned());
+        return Err(format!(
+            "repository path must be a directory: {}",
+            path.display()
+        ));
     }
     Ok(workspace)
 }
@@ -1722,6 +1978,8 @@ fn docker_arguments(
     let mut args = vec![
         "run".to_owned(),
         "--detach".to_owned(),
+        "--interactive".to_owned(),
+        "--tty".to_owned(),
         "--name".to_owned(),
         format!("gardr-{spec_name}-{run_id}"),
         "--network".to_owned(),
@@ -1731,8 +1989,39 @@ fn docker_arguments(
         }
         .to_owned(),
         "--mount".to_owned(),
-        format!("type=bind,source={},target=/workspace", workspace.display()),
+        format!("type=bind,source={},target=/repo", workspace.display()),
+        "--workdir".to_owned(),
+        "/repo".to_owned(),
+        "--mount".to_owned(),
+        "type=volume,source=gardr-nix,target=/nix".to_owned(),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,source={},target=/gardr-context/AGENTS.md,readonly",
+            store.base_context_path().display()
+        ),
     ];
+    let continuity_marker = run_directory.join("continuity.path");
+    if continuity_marker.is_file() {
+        let continuity = fs::read_to_string(&continuity_marker).map_err(io_error)?;
+        validate_docker_path("continuity path", Path::new(&continuity))?;
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target=/gardr-context/CONTINUITY.md",
+                continuity
+            ),
+        ]);
+    }
+    let input = run_directory.join("input.md");
+    if input.is_file() {
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target=/gardr-input/task.md,readonly",
+                input.display()
+            ),
+        ]);
+    }
     if matches!(resolved_network(spec), Network::Bridge) {
         args.extend([
             "--cap-add".to_owned(),
@@ -1852,8 +2141,17 @@ fn docker_arguments(
     if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
         injected.push("--session".to_owned());
         injected.push(format!("{PI_TRANSCRIPT_MOUNT}/session.jsonl"));
+        injected.push("--append-system-prompt".to_owned());
+        injected.push("/gardr-context/AGENTS.md".to_owned());
+        if continuity_marker.is_file() {
+            injected.push("--append-system-prompt".to_owned());
+            injected.push("/gardr-context/CONTINUITY.md".to_owned());
+        }
     }
     command.splice(1..1, injected);
+    if input.is_file() {
+        command.extend(["-p".to_owned(), "@/gardr-input/task.md".to_owned()]);
+    }
     args.extend(spec.startup_command.iter().cloned());
     args.extend(command);
     Ok(args)
@@ -1994,7 +2292,7 @@ fn write_bootstrap(directory: &Path, spec: &Spec, firewall_allow: &[String]) -> 
             shell_quote(&tool.check)
         ));
     }
-    script.push_str("sudo -n /usr/local/bin/init-firewall.sh '' /workspace /gardr/runtime-domains.txt\nshift\nexec \"$@\"\n");
+    script.push_str("sudo -n /usr/local/bin/init-firewall.sh '' /repo /gardr/runtime-domains.txt\nshift\nexec \"$@\"\n");
     let bootstrap = directory.join("tool-bootstrap.sh");
     write_new(&bootstrap, script.as_bytes())?;
     set_executable(&bootstrap)
@@ -2326,6 +2624,71 @@ fn new_run_id() -> String {
         std::process::id(),
         RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+fn new_workspace_id() -> String {
+    format!(
+        "workspace-{}-{}-{}",
+        now(),
+        std::process::id(),
+        RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+fn ensure_base_context(store: &Store) -> Result<()> {
+    let path = store.base_context_path();
+    if path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(path.parent().expect("base context has a parent")).map_err(io_error)?;
+    write_new(
+        &path,
+        b"# Gardr agent context\n\nWork in /repo. Each run is a fresh session. If /gardr-context/CONTINUITY.md exists, read it before working and keep it concise: decisions, current state, verification, blockers, and next work only. Never copy the conversation transcript into continuity.\n",
+    )
+}
+fn capture_run_logs(record: &RunRecord) -> Result<()> {
+    let Some(container) = record.container.as_deref() else {
+        return Ok(());
+    };
+    capture_container_logs(
+        container,
+        Path::new(&record.stdout_path),
+        Path::new(&record.stderr_path),
+    )
+}
+fn prepare_one_shot_resume(directory: &Path, record: &mut RunRecord) -> Result<()> {
+    if let Some(container) = record.container.as_deref() {
+        match docker_status(container)? {
+            Some((true, _)) => return Err(format!("run {} is still running", record.id)),
+            Some((false, _)) => capture_run_logs(record)?,
+            None => {}
+        }
+        let output = Command::new("docker")
+            .args(["rm", container])
+            .output()
+            .map_err(io_error)?;
+        if !output.status.success()
+            && !String::from_utf8_lossy(&output.stderr).contains("No such container")
+        {
+            return Err(command_error("docker rm", &output));
+        }
+    }
+    record.attempt = record.attempt.max(1) + 1;
+    record.stdout_path = directory
+        .join(format!("stdout.attempt-{}.log", record.attempt))
+        .display()
+        .to_string();
+    record.stderr_path = directory
+        .join(format!("stderr.attempt-{}.log", record.attempt))
+        .display()
+        .to_string();
+    record.state = RunState::Prepared;
+    record.container = None;
+    record.exit_status = None;
+    record.failure = None;
+    record.updated_at = now();
+    save_record(directory, record)
+}
+fn default_attempt() -> u32 {
+    1
 }
 fn command_error(name: &str, output: &std::process::Output) -> String {
     format!(
@@ -3076,10 +3439,10 @@ mod tests {
             "the global startup command must wrap the harness command"
         );
         assert!(
-            !arguments
+            arguments
                 .iter()
-                .any(|argument| argument.ends_with("target=/nix")),
-            "Gardr must not inject Nix-specific mounts"
+                .any(|argument| argument == "type=volume,source=gardr-nix,target=/nix"),
+            "Gardr must provide the global Nix cache"
         );
         assert!(
             arguments
@@ -3609,6 +3972,131 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_sources_use_current_or_explicit_directories_and_threads_reuse_them() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let image_source = temp.join("agent.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'agent:latest'\n",
+        )
+        .unwrap();
+        store.add_image("agent", &image_source).unwrap();
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        fs::create_dir_all(store.root.clone()).unwrap();
+        fs::write(
+            store.config_path(),
+            b"image = 'agent'\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
+        )
+        .unwrap();
+        let repo = temp.join("repo");
+        fs::create_dir(&repo).unwrap();
+        let ask = temp.join("ask.md");
+        fs::write(&ask, b"do the work").unwrap();
+        let bin = temp.join("bin");
+        let _docker = FakeDocker::install(
+            "#!/bin/sh\nif [ \"$1\" = image ]; then echo sha256:agent; exit 0; fi\nif [ \"$1\" = run ]; then echo container-id; exit 0; fi\nexit 1\n",
+            &bin,
+        );
+
+        let mut first = store
+            .start_one_shot(
+                StartRequest {
+                    repo: None,
+                    url: None,
+                    thread: Some("work".to_owned()),
+                    ask_file: Some(ask),
+                    current_dir: repo.clone(),
+                },
+                RuntimeOverrides::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            first.source.as_ref().unwrap().path,
+            repo.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            fs::read(first.input_path.as_ref().unwrap()).unwrap(),
+            b"do the work"
+        );
+        assert!(store.threads_path().join("work/CONTINUITY.md").is_file());
+        assert!(
+            store
+                .run_path(&first.id)
+                .unwrap()
+                .join("metadata.json")
+                .is_file()
+        );
+        assert_eq!(first.effective.image.value, "agent");
+
+        let second = store
+            .start_one_shot(
+                StartRequest {
+                    repo: None,
+                    url: None,
+                    thread: Some("work".to_owned()),
+                    ask_file: None,
+                    current_dir: temp.clone(),
+                },
+                RuntimeOverrides::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(second.source.as_ref().unwrap().path, first.workspace);
+        assert_eq!(second.effective.image.value, first.effective.image.value);
+        assert_eq!(second.effective.model.value, first.effective.model.value);
+        assert_ne!(second.transcript_path, first.transcript_path);
+
+        let original_input = first.input_path.clone();
+        let original_transcript = first.transcript_path.clone();
+        first.state = RunState::Failed;
+        first.container = None;
+        first.failure = Some("agent crashed".to_owned());
+        save_record(&store.run_path(&first.id).unwrap(), &first).unwrap();
+        let mut resumed = store.resume(&first.id).unwrap();
+        assert_eq!(resumed.attempt, 2);
+        assert_eq!(resumed.input_path, original_input);
+        assert_eq!(resumed.transcript_path, original_transcript);
+        assert_eq!(resumed.source.as_ref().unwrap().path, first.workspace);
+
+        resumed.state = RunState::Stopped;
+        resumed.exit_status = Some(0);
+        resumed.container = None;
+        save_record(&store.run_path(&resumed.id).unwrap(), &resumed).unwrap();
+        assert!(
+            store
+                .resume(&resumed.id)
+                .unwrap_err()
+                .contains("completed successfully")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn url_sources_clone_into_unique_persistent_workspaces() {
+        let temp = temporary_directory();
+        let origin = temp.join("origin");
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&origin)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let store = Store::open(temp.join("store"));
+        let first = store.clone_source(origin.to_str().unwrap()).unwrap();
+        let second = store.clone_source(origin.to_str().unwrap()).unwrap();
+        assert!(Path::new(&first.path).is_dir());
+        assert_ne!(first.workspace_id, second.workspace_id);
+        assert_ne!(first.workspace_path, second.workspace_path);
+        assert_eq!(first.url.as_deref(), origin.to_str());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn duplicate_credential_environment_names_are_rejected_at_validation() {
         let spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi']\nmodel = 'anthropic/claude-opus-4-6'\n[credentials]\nenvironment = [{name = 'GH_TOKEN', from = 'gh-pat-a'}, {name = 'GH_TOKEN', from = 'gh-pat-b'}]\n").unwrap();
         assert!(
@@ -3873,7 +4361,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_is_not_nix_specific() {
+    fn global_runtime_does_not_require_nix_specific_config() {
         let global = parse_global_config(
             b"workspace = '/workspace'\nimage = 'plain-agent'\nnetwork = 'bridge'\n[firewall]\nallow = ['packages.example.com']\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
         )

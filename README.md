@@ -1,32 +1,22 @@
 # Gardr
 
-Gardr runs prepared workspaces in Docker with durable run records, Pi transcripts, registered
-credentials, and fail-closed egress. It does not prepare workspaces, choose a toolchain, or mandate
-how an image supplies its tools.
+Gardr runs fresh Pi sessions against a selected repository in Docker. Runtime policy, the shared
+`/nix` cache, stable agent context, credentials, and fail-closed egress are Gardr-owned. Every run
+has an immutable record; optional named threads preserve only bounded continuity between runs.
 
 ## Global runtime policy
 
 Runtime policy belongs in `~/.gardr/config.toml` (or `$GARDR_ROOT/config.toml`):
 
 ```toml
-workspace = "/workspaces/default"
 image = "my-agent"
 network = "bridge"
-
-# Optional command prefix placed before the harness command.
-# For example: ["nix", "develop", "--command"] or ["toolbox", "run", "--"]
 startup_command = []
 
 [[mounts]]
 type = "volume"
 source = "shared-tool-cache"
 target = "/tool-cache"
-
-[[mounts]]
-type = "bind"
-source = "/absolute/host/path"
-target = "/extra-input"
-read_only = true
 
 [harness]
 adapter = "pi"
@@ -40,16 +30,11 @@ environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat"
 allow = ["api.github.com", "github.com"]
 ```
 
-`startup_command` and `mounts` are generic container configuration. Gardr passes named Docker
-volumes and absolute-path bind mounts through as configured; it does not inject `/nix`, create a
-Nix-specific cache policy, or require Nix. Docker creates a missing named volume on first use.
-Mount targets used internally by Gardr are reserved.
+The selected repository is mounted writable at `/repo`. Gardr also mounts its global `gardr-nix`
+volume at `/nix`, stable base instructions at `/gardr-context/AGENTS.md`, and per-run Pi state.
+Source selection never changes image, model, credentials, mounts, or network policy.
 
-`run start` may deliberately override workspace, image, harness, or model. `--network none` may
-narrow global bridge access. Per-spec runtime policy and `--spec` are removed and return migration
-errors instead of being silently ignored.
-
-Credential values live in Gardr's private registry, not the config or process environment:
+Credential values live in Gardr's private registry:
 
 ```sh
 gardr credential set github-read-only-pat --file ./pat.txt
@@ -57,9 +42,40 @@ gardr credential list
 gardr credential rm github-read-only-pat
 ```
 
+## Sources, asks, and threads
+
+```sh
+# Current directory
+gardr run start
+
+# Existing checkout
+gardr run start --repo ../project
+
+# Persistent clone under the Gardr root
+gardr run start --url https://github.com/example/project.git
+
+# Autonomous one-shot input (copied into the immutable run record)
+gardr run start --repo ../project --ask-file ./task.md
+
+# Bounded continuity: first call binds the source; later calls reuse it
+gardr run start --repo ../project --thread refactor
+gardr run start --thread refactor --ask-file ./follow-up.md
+```
+
+A URL run reports `source.workspace_id` and `source.workspace_path`; its `source.path` can also be
+passed to a later `--repo` run. A thread stores only `CONTINUITY.md`, which the worker keeps limited
+to decisions, current state, verification, blockers, and next work. Prior Pi transcripts are never
+injected into a new run.
+
+Fresh runs never inherit another run's transcript. An interrupted or unsuccessful run can be
+resumed with `gardr run resume <run-id>`; it reuses that run's frozen source, policy, original ask,
+and Pi transcript and accepts no replacement input. Successfully completed runs are terminal.
+`run observe`, `run stop`, and `run cleanup` manage the current container and retained per-attempt
+stdout/stderr, transcript, input, and metadata.
+
 ## Images
 
-Images are user-owned profiles under the Gardr root, normally `~/.gardr/images`:
+Images are user-owned profiles under the Gardr root:
 
 ```toml
 version = 1
@@ -68,13 +84,8 @@ tools = ["git", "node", "pi"]
 
 [source]
 build_context = "my-agent"
-# Or use: reference = "registry.example.com/my-agent@sha256:..."
+# Or: reference = "registry.example.com/my-agent@sha256:..."
 ```
-
-A build context is resolved relative to `~/.gardr/images`. Gardr validates/builds or pulls the
-selected image, but makes no assumptions about its package manager or toolchain. Images may contain
-all required tools directly, use Nix, or use any other startup mechanism compatible with the global
-`startup_command`.
 
 ## Commands
 
@@ -84,15 +95,9 @@ gardr image list
 gardr image show <name>
 gardr image validate <name>
 
-gardr run validate-workspace <path>
-gardr run start [--workspace <path>] [--image <name>] [--harness pi] [--model <provider/model>] \
-  [--network none] [--harness-arg <arg>]...
+gardr run start [--repo <path> | --url <git-url>] [--thread <name>] [--ask-file <path>] \
+  [--image <name>] [--harness pi] [--model <provider/model>] [--network none]
 gardr run observe <run-id>
-gardr run resume <run-id>
 gardr run stop <run-id>
 gardr run cleanup <run-id>
 ```
-
-Runs freeze their effective policy and image identity. Resume uses that frozen state rather than
-re-reading global configuration. Pi transcripts and usage survive container cleanup; cleanup also
-captures stdout/stderr before removing the container.
