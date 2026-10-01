@@ -250,6 +250,7 @@ impl Store {
         sync_pi_auth(self, &spec)?;
         validate_resolved_spec(self, &spec)?;
         let workspace = validate_workspace(Path::new(&effective.workspace.value))?;
+        let heimr_mount_plan = heimr_mount_plan(&workspace)?;
         fs::create_dir_all(self.runs_path()).map_err(io_error)?;
         let id = new_run_id();
         let directory = self.run_path(&id)?;
@@ -261,6 +262,7 @@ impl Store {
             spec: identity,
             effective: effective.clone(),
             workspace: workspace.display().to_string(),
+            heimr_mount_plan,
             image: None,
             image_profile: None,
             container: None,
@@ -341,6 +343,7 @@ impl Store {
         // values recorded at `run start` and only reloads the frozen spec.toml (if any) for the
         // static, unlayered fields (sandbox, mounts, credentials, firewall, tools).
         let workspace = validate_workspace(Path::new(&record.effective.workspace.value))?;
+        verify_locked_heimr_environment(&workspace, &record.heimr_mount_plan)?;
         let baseline = match &record.spec {
             Some(identity) => {
                 let frozen = fs::read(directory.join("spec.toml")).map_err(io_error)?;
@@ -364,7 +367,7 @@ impl Store {
                 "run has incomplete resolved configuration and cannot be resumed".to_owned(),
             );
         }
-        self.launch(record, workspace, spec)
+        self.launch(record, spec)
     }
 
     pub fn start(
@@ -374,8 +377,7 @@ impl Store {
         harness_args: Vec<String>,
     ) -> Result<RunRecord> {
         let (record, spec) = self.create_run(overrides, spec_name, harness_args)?;
-        let workspace = PathBuf::from(&record.workspace);
-        self.launch(record, workspace, spec)
+        self.launch(record, spec)
     }
 
     pub fn observe(&self, id: &str) -> Result<RunRecord> {
@@ -495,7 +497,7 @@ impl Store {
         write_new(&directory.join("cleanup.complete"), b"cleaned\n")
     }
 
-    fn launch(&self, mut record: RunRecord, workspace: PathBuf, spec: Spec) -> Result<RunRecord> {
+    fn launch(&self, mut record: RunRecord, spec: Spec) -> Result<RunRecord> {
         let directory = self.run_path(&record.id)?;
         let image = match &record.image {
             Some(image) => image.clone(),
@@ -522,7 +524,7 @@ impl Store {
         let arguments = match docker_arguments(
             self,
             &spec,
-            &workspace,
+            &record.heimr_mount_plan,
             &directory,
             spec_label,
             &record.id,
@@ -532,6 +534,27 @@ impl Store {
             Ok(arguments) => arguments,
             Err(error) => return fail_run(&directory, &mut record, error),
         };
+        if let Some(previous_container) = record.container.take() {
+            // `resume` launches a fresh container under the same deterministic name
+            // (`gardr-{spec}-{run_id}`); the prior container from an earlier start/resume is
+            // stopped but never removed, so it must be cleared first or `docker run --name`
+            // conflicts with it. Capture its logs first (best-effort, like `cleanup`) so a
+            // resumed run never silently loses the previous attempt's stdout/stderr evidence,
+            // then remove it; an already-removed container is not an error either way.
+            if let Err(error) = capture_container_logs(
+                &previous_container,
+                Path::new(&record.stdout_path),
+                Path::new(&record.stderr_path),
+            ) {
+                append_log(
+                    &directory,
+                    &format!("log capture before relaunch failed: {error}"),
+                )?;
+            }
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &previous_container])
+                .output();
+        }
         let output = match Command::new("docker").args(&arguments).output() {
             Ok(output) => output,
             Err(error) => {
@@ -815,7 +838,9 @@ pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
         validate_container_path("mount target", &mount.target)?;
         if matches!(
             mount.target.as_str(),
-            "/workspace"
+            "/repo"
+                | "/agent"
+                | "/agent-state"
                 | "/gardr"
                 | "/pi-agent"
                 | "/gardr-transcript"
@@ -1183,6 +1208,10 @@ pub struct RunRecord {
     /// verbatim and never re-merges the global config, spec, or CLI layers.
     pub effective: EffectiveRuntime,
     pub workspace: String,
+    /// The Heimr mount plan and curated-environment digest, frozen at `run start`. `resume`
+    /// relaunches from this value and only re-derives the live plan to detect drift; it never
+    /// substitutes the recomputed value for the frozen one.
+    pub heimr_mount_plan: MountPlanRecord,
     pub image: Option<String>,
     #[serde(default)]
     pub image_profile: Option<SpecIdentity>,
@@ -1249,6 +1278,7 @@ impl std::fmt::Display for RunState {
 struct ResolvedConfig<'a> {
     run_id: &'a str,
     workspace: String,
+    heimr_mount_plan: &'a MountPlanRecord,
     spec: &'a Option<SpecIdentity>,
     effective: &'a EffectiveRuntime,
     image: &'a Image,
@@ -1290,6 +1320,7 @@ impl<'a> ResolvedConfig<'a> {
         Self {
             run_id: &record.id,
             workspace: record.workspace.clone(),
+            heimr_mount_plan: &record.heimr_mount_plan,
             spec: &record.spec,
             effective: &record.effective,
             image: &spec.image,
@@ -1444,8 +1475,11 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
             return Err(format!("duplicate mount name: {}", mount.name));
         }
         validate_container_path("mount target", &mount.target)?;
-        if mount.target == "/workspace" {
-            return Err("/workspace is reserved for the prepared workspace".to_owned());
+        if matches!(mount.target.as_str(), "/repo" | "/agent" | "/agent-state") {
+            return Err(format!(
+                "{} is reserved for the prepared Heimr workspace",
+                mount.target
+            ));
         }
         if !targets.insert(&mount.target) {
             return Err(format!("duplicate mount target: {}", mount.target));
@@ -1648,12 +1682,80 @@ fn verify_locked_mounts(store: &Store, spec: &Spec, directory: &Path) -> Result<
     Ok(())
 }
 
-pub fn validate_workspace(path: &Path) -> Result<PathBuf> {
-    let workspace = path.canonicalize().map_err(io_error)?;
-    if !workspace.is_dir() {
-        return Err("workspace must be a directory".to_owned());
+/// Opens the Heimr workspace at `path`: the final path component is the workspace name, its
+/// parent is the Heimr root. Gardr never writes to a Heimr workspace itself; it only reads the
+/// curated environment and mount plan Heimr already validated.
+fn open_heimr_workspace(path: &Path) -> Result<heimr::Workspace> {
+    let path = path.canonicalize().map_err(io_error)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "workspace path must have a final directory component".to_owned())?
+        .to_owned();
+    let root = path
+        .parent()
+        .ok_or_else(|| "workspace path must have a parent Heimr root".to_owned())?
+        .to_owned();
+    heimr::Workspace::open(&root, &name)
+}
+
+/// A Heimr `MountPlan`, flattened to Gardr's own serializable shape and paired with the
+/// curated environment's content digest, frozen into `RunRecord` at `run start`. `resume` uses
+/// this frozen value verbatim for the container's bind mounts rather than recomputing it, and
+/// separately re-derives it from the live workspace only to detect drift (see
+/// `verify_locked_heimr_environment`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MountPlanRecord {
+    pub version: u32,
+    pub mounts: Vec<MountRecord>,
+    pub environment_sha256: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MountRecord {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+const HEIMR_REPO_TARGET: &str = "/repo";
+
+fn heimr_mount_plan(path: &Path) -> Result<MountPlanRecord> {
+    let workspace = open_heimr_workspace(path)?;
+    let plan = workspace.mount_plan()?;
+    let manifest =
+        fs::read(workspace.environment_path().join("manifest.json")).map_err(io_error)?;
+    Ok(MountPlanRecord {
+        version: plan.version,
+        mounts: plan
+            .mounts
+            .into_iter()
+            .map(|mount| MountRecord {
+                source: mount.source,
+                target: mount.target,
+                read_only: mount.read_only,
+            })
+            .collect(),
+        environment_sha256: digest(&manifest),
+    })
+}
+
+/// Re-derives the Heimr mount plan from the live workspace and fails if it no longer matches
+/// `locked`: a curated environment or source selection that changed after `run start` must not
+/// silently steer a resumed run. The launch mounts themselves always come from `locked`, never
+/// from this recomputed value.
+fn verify_locked_heimr_environment(workspace: &Path, locked: &MountPlanRecord) -> Result<()> {
+    let current = heimr_mount_plan(workspace)?;
+    if &current != locked {
+        return Err(
+            "Heimr workspace environment or source changed since the run was created".to_owned(),
+        );
     }
-    Ok(workspace)
+    Ok(())
+}
+
+pub fn validate_workspace(path: &Path) -> Result<PathBuf> {
+    let workspace = open_heimr_workspace(path)?;
+    workspace.mount_plan()?;
+    Ok(workspace.root)
 }
 
 fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
@@ -1710,14 +1812,13 @@ fn ensure_image(store: &Store, spec: &Spec) -> Result<(String, SpecIdentity)> {
 fn docker_arguments(
     store: &Store,
     spec: &Spec,
-    workspace: &Path,
+    heimr_mount_plan: &MountPlanRecord,
     run_directory: &Path,
     spec_name: &str,
     run_id: &str,
     image: &str,
     harness_args: &[String],
 ) -> Result<Vec<String>> {
-    validate_docker_path("workspace path", workspace)?;
     validate_docker_path("run directory", run_directory)?;
     let mut args = vec![
         "run".to_owned(),
@@ -1730,9 +1831,20 @@ fn docker_arguments(
             Network::Bridge => "bridge",
         }
         .to_owned(),
-        "--mount".to_owned(),
-        format!("type=bind,source={},target=/workspace", workspace.display()),
+        "--workdir".to_owned(),
+        HEIMR_REPO_TARGET.to_owned(),
     ];
+    for mount in &heimr_mount_plan.mounts {
+        validate_docker_path("Heimr mount source", Path::new(&mount.source))?;
+        let readonly = if mount.read_only { ",readonly" } else { "" };
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,source={},target={}{}",
+                mount.source, mount.target, readonly
+            ),
+        ]);
+    }
     if matches!(resolved_network(spec), Network::Bridge) {
         args.extend([
             "--cap-add".to_owned(),
@@ -1854,9 +1966,27 @@ fn docker_arguments(
         injected.push(format!("{PI_TRANSCRIPT_MOUNT}/session.jsonl"));
     }
     command.splice(1..1, injected);
+    if matches!(spec.harness.adapter, Some(Adapter::Pi)) {
+        // Gardr always supplies the initial message itself, so the task's actual content stays
+        // in the mounted environment files (see `heimr_invariant_startup_instruction`) rather
+        // than in a process argument; `validate_dispatch_harness_args` keeps callers from
+        // smuggling task content back in through `harness_args`.
+        command.push(heimr_invariant_startup_instruction());
+    }
     args.extend(spec.startup_command.iter().cloned());
     args.extend(command);
     Ok(args)
+}
+
+/// The fixed initial message Gardr gives the agent on every launch: a short pointer at the
+/// curated Heimr environment, never the task content itself (see `AGENTS.md`/`task.md`/
+/// `prompt.md`/`context/INDEX.md` in `heimr`'s curated environment contract). It is deliberately
+/// the same literal string on every run so it carries no run-specific or large content.
+fn heimr_invariant_startup_instruction() -> String {
+    "Read /agent/AGENTS.md, then /agent/task.md and /agent/prompt.md, then /agent/context/INDEX.md \
+     before acting. Also read any repository-local AGENTS.md under /repo. Do not overlay, hide, or \
+     replace any file under /repo; it is the working repository, writable in place."
+        .to_owned()
 }
 
 /// Gardr ships no hardcoded minimum allowlist and has no separate maximum: the effective bridge
@@ -1994,7 +2124,10 @@ fn write_bootstrap(directory: &Path, spec: &Spec, firewall_allow: &[String]) -> 
             shell_quote(&tool.check)
         ));
     }
-    script.push_str("sudo -n /usr/local/bin/init-firewall.sh '' /workspace /gardr/runtime-domains.txt\nshift\nexec \"$@\"\n");
+    // The second positional argument is a historical placeholder `init-firewall.sh` has never
+    // read (only the domains file, the third argument, matters); kept as `-` rather than the
+    // removed `/workspace` mount so it no longer implies a meaning it never had.
+    script.push_str("sudo -n /usr/local/bin/init-firewall.sh '' - /gardr/runtime-domains.txt\nshift\nexec \"$@\"\n");
     let bootstrap = directory.join("tool-bootstrap.sh");
     write_new(&bootstrap, script.as_bytes())?;
     set_executable(&bootstrap)
@@ -2408,6 +2541,11 @@ fn validate_harness_args(arguments: &[String]) -> Result<()> {
         validate_command("harness arguments", arguments)
     }
 }
+/// Harness arguments longer than this are rejected outright: task content belongs in the Heimr
+/// workspace's curated `environment/prompt.md` (mounted at `/agent/prompt.md`), never in a
+/// process argument visible to every reader of `docker inspect`/`ps`.
+const MAX_HARNESS_ARGUMENT_LENGTH: usize = 2000;
+
 fn validate_dispatch_harness_args(spec: &Spec, arguments: &[String]) -> Result<()> {
     if matches!(spec.harness.adapter, Some(Adapter::Pi))
         && arguments.iter().any(|argument| {
@@ -2417,6 +2555,16 @@ fn validate_dispatch_harness_args(spec: &Spec, arguments: &[String]) -> Result<(
         return Err(
             "Pi dispatch arguments must not select a model, provider, or session".to_owned(),
         );
+    }
+    if let Some(oversized) = arguments
+        .iter()
+        .find(|argument| argument.len() > MAX_HARNESS_ARGUMENT_LENGTH)
+    {
+        return Err(format!(
+            "harness argument exceeds {MAX_HARNESS_ARGUMENT_LENGTH} bytes ({} bytes); put large \
+             content in the Heimr workspace's curated environment instead of a process argument",
+            oversized.len()
+        ));
     }
     Ok(())
 }
@@ -2550,6 +2698,43 @@ mod tests {
             ..Default::default()
         }
     }
+    /// A `MountPlanRecord` fabricated for tests that exercise `docker_arguments` directly and do
+    /// not need a real Heimr workspace: the paths need not exist, since `docker_arguments` only
+    /// validates their shape, not their presence.
+    fn sample_mount_plan(root: &Path) -> MountPlanRecord {
+        MountPlanRecord {
+            version: 1,
+            mounts: vec![
+                MountRecord {
+                    source: root.join("repository").display().to_string(),
+                    target: HEIMR_REPO_TARGET.to_owned(),
+                    read_only: false,
+                },
+                MountRecord {
+                    source: root.join("environment").display().to_string(),
+                    target: "/agent".to_owned(),
+                    read_only: true,
+                },
+                MountRecord {
+                    source: root.join("state").display().to_string(),
+                    target: "/agent-state".to_owned(),
+                    read_only: false,
+                },
+            ],
+            environment_sha256: digest(b"sample"),
+        }
+    }
+    /// Builds a real, Gardr-consumable Heimr workspace under `root/<name>`: a mounted source at
+    /// `root/source` with no curated-environment overrides, so `mount_plan()` validates cleanly.
+    fn heimr_workspace_fixture(root: &Path, name: &str) -> PathBuf {
+        let heimr_root = root.join("heimr");
+        let source = root.join(format!("{name}-source"));
+        fs::create_dir_all(&source).unwrap();
+        let workspace = heimr::Workspace::open(&heimr_root, name).unwrap();
+        workspace.create().unwrap();
+        workspace.set_mounted_source(&source).unwrap();
+        workspace.root.clone()
+    }
     fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gardr-test-{}-{}",
@@ -2623,21 +2808,24 @@ mod tests {
     }
 
     #[test]
-    fn workspace_validation_accepts_arbitrary_directory_contents() {
+    fn workspace_validation_accepts_a_valid_heimr_workspace() {
         let temp = temporary_directory();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(workspace.join("arbitrary-input"), b"content").unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         assert!(validate_workspace(&workspace).unwrap().is_dir());
         fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
-    fn workspace_validation_rejects_non_directories() {
+    fn workspace_validation_rejects_a_plain_directory_and_a_missing_path() {
         let temp = temporary_directory();
-        let file = temp.join("workspace");
-        fs::write(&file, b"not a directory").unwrap();
-        assert!(validate_workspace(&file).unwrap_err().contains("directory"));
+        let plain_directory = temp.join("workspace");
+        fs::create_dir_all(&plain_directory).unwrap();
+        assert!(
+            validate_workspace(&plain_directory)
+                .unwrap_err()
+                .contains("curated environment"),
+            "a bare directory is not a Heimr workspace"
+        );
         assert!(validate_workspace(&temp.join("missing")).is_err());
         fs::remove_dir_all(temp).unwrap();
     }
@@ -2726,7 +2914,7 @@ mod tests {
         let arguments = docker_arguments(
             &Store::open(temp.join("store")),
             &spec,
-            &temp,
+            &sample_mount_plan(&temp),
             &temp,
             "example",
             "run-test",
@@ -2871,8 +3059,7 @@ mod tests {
     fn create_run_resolves_from_global_config_alone_with_no_spec() {
         let temp = temporary_directory();
         let store = Store::open(temp.join("store"));
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(workspace.join("dispatches")).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         let image_source = temp.join("example.toml");
         fs::write(
             &image_source,
@@ -2919,8 +3106,7 @@ mod tests {
     fn create_run_rejects_a_missing_required_key_naming_it() {
         let temp = temporary_directory();
         let store = Store::open(temp.join("store"));
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         let overrides = RuntimeOverrides {
             workspace: Some(workspace.display().to_string()),
             ..Default::default()
@@ -2943,8 +3129,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -2982,6 +3167,51 @@ mod tests {
         assert_eq!(resumed.effective.model.value, "anthropic/claude-opus-4-6");
         assert_eq!(resumed.effective.network.value, Network::None);
         assert_eq!(resumed.effective.firewall_allow.value, Vec::<String>::new());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_a_curated_environment_mutated_after_run_start() {
+        let temp = temporary_directory();
+        let store = Store::open(temp.join("store"));
+        let source = temp.join("spec.toml");
+        fs::write(&source, spec()).unwrap();
+        let image_source = temp.join("example.toml");
+        fs::write(
+            &image_source,
+            b"version = 1\nharnesses = ['pi']\n[source]\nreference = 'example:latest'\n",
+        )
+        .unwrap();
+        store.add_image("example", &image_source).unwrap();
+        store.add_spec("build", &source).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
+        fs::create_dir_all(store.pi_agent_path()).unwrap();
+        fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
+        set_private_directory(&store.pi_agent_path()).unwrap();
+        set_private_file(&store.pi_agent_path().join("auth.json")).unwrap();
+        let (mut record, _) = store
+            .create_run(overrides_for(&workspace), Some("build"), vec![])
+            .unwrap();
+
+        // A curated environment edited after `run start` (e.g. the orchestrator overwrote
+        // AGENTS.md on the live Heimr workspace) must not silently steer a resumed run.
+        let heimr_workspace = open_heimr_workspace(&workspace).unwrap();
+        heimr_workspace
+            .put_environment_file(Path::new("AGENTS.md"), b"mutated after run start")
+            .unwrap();
+
+        let directory = store.run_path(&record.id).unwrap();
+        record.state = RunState::Stopped;
+        record.image = Some("image-id".to_owned());
+        record.image_profile = Some(SpecIdentity {
+            name: "example".to_owned(),
+            sha256: "deadbeef".to_owned(),
+        });
+        save_record(&directory, &record).unwrap();
+        write_new(&directory.join("resolved.json"), b"{}").unwrap();
+
+        let error = store.resume(&record.id).unwrap_err();
+        assert!(error.contains("changed since"), "{error}");
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -3025,12 +3255,12 @@ mod tests {
         let arguments = docker_arguments(
             &store,
             &spec,
-            &temp,
+            &sample_mount_plan(&temp),
             &temp,
             "example",
             "run-test",
             "image-id",
-            &["-p".to_owned(), "complete the assigned work".to_owned()],
+            &["-p".to_owned()],
         )
         .unwrap();
         assert!(
@@ -3054,7 +3284,9 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--model", "anthropic/claude-opus-4-6:high"])
         );
-        assert!(arguments.ends_with(&["-p".to_owned(), "complete the assigned work".to_owned()]));
+        // Gardr always supplies the initial message itself: the caller's `-p` flag survives, but
+        // the trailing prompt content is Gardr's fixed invariant instruction, never caller text.
+        assert!(arguments.ends_with(&["-p".to_owned(), heimr_invariant_startup_instruction()]));
         assert!(
             !arguments.iter().any(|argument| argument == "--no-session"),
             "Gardr must drop --no-session for the pi adapter so a transcript is written"
@@ -3138,8 +3370,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(workspace.join("dispatches")).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3394,8 +3625,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3457,8 +3687,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3510,8 +3739,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3627,7 +3855,7 @@ mod tests {
         let arguments = docker_arguments(
             &store,
             &spec,
-            &temp,
+            &sample_mount_plan(&temp),
             &temp,
             "example",
             "run-test",
@@ -3667,7 +3895,7 @@ mod tests {
         let error = docker_arguments(
             &store,
             &spec,
-            &temp,
+            &sample_mount_plan(&temp),
             &temp,
             "example",
             "run-test",
@@ -3747,8 +3975,7 @@ mod tests {
         .unwrap();
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3797,8 +4024,7 @@ mod tests {
         store.add_image("example", &image_source).unwrap();
         store.add_spec("build", &source).unwrap();
         store.set_credential("GH_TOKEN", b"super-secret").unwrap();
-        let workspace = temp.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = heimr_workspace_fixture(&temp, "workspace");
         fs::create_dir_all(store.pi_agent_path()).unwrap();
         fs::write(store.pi_agent_path().join("auth.json"), b"{}").unwrap();
         set_private_directory(&store.pi_agent_path()).unwrap();
@@ -3866,7 +4092,7 @@ mod tests {
         assert!(relative.contains("must be absolute"), "{relative}");
 
         let reserved = parse_global_config(
-            b"[[mounts]]\ntype = 'volume'\nsource = 'shared-tools'\ntarget = '/workspace'\n",
+            b"[[mounts]]\ntype = 'volume'\nsource = 'shared-tools'\ntarget = '/repo'\n",
         )
         .unwrap_err();
         assert!(reserved.contains("reserved"), "{reserved}");

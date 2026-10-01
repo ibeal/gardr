@@ -265,9 +265,25 @@ const DOCS: &str = r#"# gardr — durable sandbox execution
 Gardr runs prepared workspaces with runtime policy from `<root>/config.toml`. It does not prescribe
 how an image supplies its tools. The former spec layer and `--spec` are removed.
 
+`workspace` (global config, spec, or `--workspace`) names a Heimr workspace directory, not an
+arbitrary one: Gardr validates it and consumes Heimr's `mount-plan` to bind-mount the selected
+source or managed clone read-write at `/repo`, the curated `environment/` read-only at `/agent`,
+and `state/` read-write at `/agent-state`. The container's working directory is always `/repo`.
+Gardr never overlays or hides anything under `/repo`. Every launch injects a fixed, short initial
+message pointing the agent at `/agent/AGENTS.md`, `/agent/task.md`, `/agent/prompt.md`, and
+`/agent/context/INDEX.md`; task content belongs in those curated files, never in a harness argument
+(`run start --harness-arg` rejects anything long enough to carry it). The Heimr mount plan and the
+curated environment's content digest are frozen into the run record at `run start`; `resume`
+relaunches from that frozen value and fails if the live Heimr workspace has since changed.
+Interactive and autonomous launch share this identical preparation and differ only in how the
+caller attaches to the container; Pi's session JSONL lives at the same durable per-run path either
+way, so resuming after the container stops reattaches the same conversation rather than starting a
+new one.
+
 ```toml
 workspace = "/workspaces/default"
 image = "my-agent"
+# must be a Heimr workspace directory (`heimr new`/`heimr repo prepare`/`heimr source mount`)
 network = "bridge"
 startup_command = ["toolbox", "run", "--"]
 
