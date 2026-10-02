@@ -2,7 +2,7 @@
 name = "gardr"
 version = "0.1.0"
 edition = "2024"
-description = "Durable sandbox execution for prepared agent workspaces"
+description = "One-shot sandbox execution for agent repositories"
 
 [lib]
 path = "src/lib.rs"
