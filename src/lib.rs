@@ -918,7 +918,7 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub credentials: Credentials,
     /// Optional command placed between Gardr's firewall bootstrap and the harness command. This is
-    /// useful for image-independent wrappers such as `nix develop --command`.
+    /// useful for image-independent wrappers such as shell or environment setup commands.
     #[serde(default)]
     pub startup_command: Vec<String>,
     /// Trusted, global container mounts. They are deliberately not accepted from legacy specs.
@@ -999,7 +999,6 @@ pub fn parse_global_config(content: &[u8]) -> Result<GlobalConfig> {
             mount.target.as_str(),
             "/workspace"
                 | "/repo"
-                | "/nix"
                 | "/gardr"
                 | "/gardr-context"
                 | "/gardr-input"
@@ -1694,7 +1693,7 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         validate_container_path("mount target", &mount.target)?;
         if matches!(
             mount.target.as_str(),
-            "/workspace" | "/repo" | "/nix" | "/gardr-context" | "/gardr-input"
+            "/workspace" | "/repo" | "/gardr-context" | "/gardr-input"
         ) {
             return Err(format!("{} is reserved by Gardr", mount.target));
         }
@@ -1992,8 +1991,6 @@ fn docker_arguments(
         format!("type=bind,source={},target=/repo", workspace.display()),
         "--workdir".to_owned(),
         "/repo".to_owned(),
-        "--mount".to_owned(),
-        "type=volume,source=gardr-nix,target=/nix".to_owned(),
         "--mount".to_owned(),
         format!(
             "type=bind,source={},target=/gardr-context/AGENTS.md,readonly",
@@ -3372,11 +3369,7 @@ mod tests {
     #[test]
     fn pi_docker_arguments_mount_managed_auth_and_select_model() {
         let mut spec = parse_spec(b"version = 1\n[image]\nname = 'example'\n[sandbox]\nnetwork = 'none'\n[harness]\nadapter = 'pi'\ncommand = ['pi', '--no-session']\nmodel = 'anthropic/claude-opus-4-6:high'\n").unwrap();
-        spec.startup_command = vec![
-            "nix".to_owned(),
-            "develop".to_owned(),
-            "--command".to_owned(),
-        ];
+        spec.startup_command = vec!["env".to_owned(), "MY_VAR=1".to_owned()];
         spec.runtime_mounts = vec![RuntimeMount {
             kind: RuntimeMountType::Volume,
             source: "shared-tools".to_owned(),
@@ -3434,15 +3427,9 @@ mod tests {
         );
         assert!(
             arguments
-                .windows(4)
-                .any(|arguments| arguments == ["nix", "develop", "--command", "pi"]),
+                .windows(3)
+                .any(|arguments| arguments == ["env", "MY_VAR=1", "pi"]),
             "the global startup command must wrap the harness command"
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "type=volume,source=gardr-nix,target=/nix"),
-            "Gardr must provide the global Nix cache"
         );
         assert!(
             arguments
@@ -4361,7 +4348,7 @@ mod tests {
     }
 
     #[test]
-    fn global_runtime_does_not_require_nix_specific_config() {
+    fn global_runtime_does_not_require_startup_or_mount_config() {
         let global = parse_global_config(
             b"workspace = '/workspace'\nimage = 'plain-agent'\nnetwork = 'bridge'\n[firewall]\nallow = ['packages.example.com']\n[harness]\nadapter = 'pi'\nmodel = 'anthropic/claude-opus-4-6'\n",
         )

@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::process::Command;
 
 use gardr::{StartRequest, Store, validate_workspace};
 
@@ -178,7 +179,13 @@ fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
             }
             let harness_args = options(&mut args, "--harness-arg");
             reject_extra(&args)?;
-            print_json(&store.start_one_shot(request, overrides, harness_args)?)
+            let interactive = is_interactive(&request, &harness_args);
+            let record = store.start_one_shot(request, overrides, harness_args)?;
+            if interactive {
+                attach_interactive(&record)
+            } else {
+                print_json(&record)
+            }
         }
         "observe" => {
             let id = take(&mut args)?;
@@ -209,6 +216,42 @@ fn run_command(store: &Store, mut args: Vec<String>) -> Result<(), String> {
             )
         }
         _ => Err(usage()),
+    }
+}
+
+/// Returns `true` when the caller's terminal should be attached to the launched container
+/// session instead of printing a machine-readable run record. Interactive mode is chosen when
+/// neither `--ask-file` nor any `--harness-arg` was supplied, meaning the operator expects to
+/// drive the session manually.
+fn is_interactive(request: &StartRequest, harness_args: &[String]) -> bool {
+    request.ask_file.is_none() && harness_args.is_empty()
+}
+
+/// Attaches the caller's terminal to the running container via `docker attach`. The container
+/// was started with `--interactive --tty`, so Docker allocates a TTY and `attach` connects
+/// stdin/stdout/stderr. The default Docker detach sequence is **Ctrl-P, Ctrl-Q**, which
+/// disconnects the client while leaving the container running.
+///
+/// A failed `docker attach` (spawn error or non-zero exit) is surfaced as a Gardr error.
+fn attach_interactive(record: &gardr::RunRecord) -> Result<(), String> {
+    let container = record
+        .container
+        .as_deref()
+        .ok_or_else(|| "interactive attach requires a container identifier".to_owned())?;
+    let status = Command::new("docker")
+        .args(["attach", container])
+        .status()
+        .map_err(|error| format!("failed to spawn docker attach: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "docker attach exited with status {}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        ))
     }
 }
 
@@ -279,7 +322,7 @@ const SPEC_HELP: &str = "Per-spec runtime configuration has been removed. Move i
 
 const IMAGE_HELP: &str = "Manage named image profiles\n\nUsage: gardr [--root <path>] image <COMMAND>\n\nCommands:\n  add       Validate and store an immutable image profile: gardr image add <name> --file <path>\n  list      Print stored image profile names as JSON\n  show      Print a stored image profile; writes its SHA-256 to stderr\n  validate  Print a stored image profile's identity as JSON\n\nNote: a harnesses list containing \"claude-code\" is not supported today (no credential bootstrap);\n`image add` rejects it. Use \"pi\" with an Anthropic model instead.\n\nUse `gardr docs` for the image profile format.\n";
 
-const RUN_HELP: &str = "Manage one-shot agent runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               [--repo <path> | --url <git-url>] [--thread <name>] [--ask-file <path>]\n                      [--image <name>] [--harness <adapter>] [--model <name>]\n                      [--network none] [--harness-arg <arg>]...\n  observe             <run-id>\n  resume              <interrupted-run-id>\n  stop                <run-id>\n  cleanup             <run-id>\n  validate-workspace  <path>\n\nWith no source option, start uses the current directory (or an existing thread's source). --url\ncreates a persistent checkout beneath the Gardr root. Interrupted runs resume their frozen source,\noriginal ask, and Pi transcript; successful runs are terminal. Runtime policy remains global.\n";
+const RUN_HELP: &str = "Manage one-shot agent runs\n\nUsage: gardr [--root <path>] run <COMMAND>\n\nCommands:\n  start               [--repo <path> | --url <git-url>] [--thread <name>] [--ask-file <path>]\n                      [--image <name>] [--harness <adapter>] [--model <name>]\n                      [--network none] [--harness-arg <arg>]...\n  observe             <run-id>\n  resume              <interrupted-run-id>\n  stop                <run-id>\n  cleanup             <run-id>\n  validate-workspace  <path>\n\nWith no source option, start uses the current directory (or an existing thread's source). --url\ncreates a persistent checkout beneath the Gardr root. With no --ask-file or --harness-arg, start\nattaches the terminal to the harness; detach with Ctrl-P, Ctrl-Q. Autonomous runs remain detached.\nInterrupted runs resume their frozen source, original ask, and Pi transcript; successful runs are\nterminal. Runtime policy remains global.\n";
 
 const CREDENTIAL_HELP: &str = "Manage the registered credential store\n\nUsage: gardr [--root <path>] credential <COMMAND>\n\nCommands:\n  set   gardr credential set <name> --file <path> | --stdin\n  list  Print registered names as JSON\n  rm    Remove a registered value: <name>\n\nValues are never printed. Global config [credentials] entries select registry names and aliases.\n";
 
@@ -287,7 +330,10 @@ const DOCS: &str = r#"# gardr — one-shot sandbox execution
 
 `run start` selects the current directory by default, `--repo <path>` selects an existing checkout,
 and `--url <git-url>` creates a persistent clone under `<root>/workspaces`. Every source is mounted
-writable at `/repo`. `--ask-file <path>` copies an autonomous ask into the immutable run record.
+writable at `/repo`. With no `--ask-file` or `--harness-arg`, `run start` attaches the terminal to
+an interactive harness session; use Docker's default Ctrl-P, Ctrl-Q sequence to detach without
+stopping it. Supplying either kind of autonomous input leaves the run detached and prints its JSON
+record. `--ask-file <path>` copies an autonomous ask into the immutable run record.
 
 A named `--thread` binds a source to `<root>/threads/<name>/CONTINUITY.md`. Later fresh runs reuse
 that source and continuity file, but always get a new Pi transcript. An interrupted or unsuccessful
@@ -313,9 +359,10 @@ environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat"
 allow = ["api.github.com", "github.com"]
 ```
 
-Gardr supplies a shared `gardr-nix` volume at `/nix` and stable base instructions at
-`/gardr-context/AGENTS.md`. Source selection never changes image, model, credentials, mounts,
-network policy, or provider-domain inference. Image profiles remain under `<root>/images`.
+Gardr mounts stable base instructions at `/gardr-context/AGENTS.md`. Additional volumes and bind
+mounts are user-owned runtime policy configured through `[[mounts]]`. Source selection never changes
+image, model, credentials, mounts, network policy, or provider-domain inference. Image profiles
+remain under `<root>/images`.
 "#;
 
 fn root(
@@ -390,6 +437,28 @@ mod tests {
             ["-p", "complete the assigned work"]
         );
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn start_is_interactive_only_without_autonomous_input() {
+        let request = StartRequest {
+            repo: None,
+            url: None,
+            thread: None,
+            ask_file: None,
+            current_dir: PathBuf::from("/repo"),
+        };
+        assert!(is_interactive(&request, &[]));
+        assert!(!is_interactive(
+            &request,
+            &["-p".to_owned(), "do the work".to_owned()]
+        ));
+
+        let request_with_file = StartRequest {
+            ask_file: Some(PathBuf::from("task.md")),
+            ..request
+        };
+        assert!(!is_interactive(&request_with_file, &[]));
     }
 
     #[test]

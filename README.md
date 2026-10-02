@@ -1,8 +1,8 @@
 # Gardr
 
-Gardr runs fresh Pi sessions against a selected repository in Docker. Runtime policy, the shared
-`/nix` cache, stable agent context, credentials, and fail-closed egress are Gardr-owned. Every run
-has an immutable record; optional named threads preserve only bounded continuity between runs.
+Gardr runs fresh Pi sessions against a selected repository in Docker. Runtime policy, stable agent
+context, credentials, and fail-closed egress are Gardr-owned. Every run has an immutable record;
+optional named threads preserve only bounded continuity between runs.
 
 ## Global runtime policy
 
@@ -30,9 +30,10 @@ environment = ["GH_TOKEN", { name = "GH_TOKEN_RO", from = "github-read-only-pat"
 allow = ["api.github.com", "github.com"]
 ```
 
-The selected repository is mounted writable at `/repo`. Gardr also mounts its global `gardr-nix`
-volume at `/nix`, stable base instructions at `/gardr-context/AGENTS.md`, and per-run Pi state.
-Source selection never changes image, model, credentials, mounts, or network policy.
+The selected repository is mounted writable at `/repo`. Gardr mounts stable base instructions at
+`/gardr-context/AGENTS.md` and per-run Pi state. Additional volumes and bind mounts are user-owned
+runtime policy configured through `[[mounts]]` in `config.toml`. Source selection never changes
+image, model, credentials, mounts, or network policy.
 
 Credential values live in Gardr's private registry:
 
@@ -45,8 +46,9 @@ gardr credential rm github-read-only-pat
 ## Sources, asks, and threads
 
 ```sh
-# Current directory
+# Current directory; attaches an interactive Pi session
 gardr run start
+# Detach without stopping it: Ctrl-P, Ctrl-Q
 
 # Existing checkout
 gardr run start --repo ../project
@@ -61,6 +63,9 @@ gardr run start --repo ../project --ask-file ./task.md
 gardr run start --repo ../project --thread refactor
 gardr run start --thread refactor --ask-file ./follow-up.md
 ```
+
+With neither `--ask-file` nor `--harness-arg`, `run start` attaches the terminal to the harness.
+Supplying either form of autonomous input keeps the run detached and prints its JSON record.
 
 A URL run reports `source.workspace_id` and `source.workspace_path`; its `source.path` can also be
 passed to a later `--repo` run. A thread stores only `CONTINUITY.md`, which the worker keeps limited
