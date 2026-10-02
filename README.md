@@ -64,8 +64,9 @@ gardr run start --repo ../project --thread refactor
 gardr run start --thread refactor --ask-file ./follow-up.md
 ```
 
-With neither `--ask-file` nor `--harness-arg`, `run start` attaches the terminal to the harness.
-Supplying either form of autonomous input keeps the run detached and prints its JSON record.
+With neither `--ask-file` nor `--harness-arg`, `run start` attaches the terminal to the harness and
+forwards `TERM` and `COLORTERM` so terminal capabilities are preserved. Supplying either form of
+autonomous input keeps the run detached and prints its JSON record.
 
 A URL run reports `source.workspace_id` and `source.workspace_path`; its `source.path` can also be
 passed to a later `--repo` run. A thread stores only `CONTINUITY.md`, which the worker keeps limited

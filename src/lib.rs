@@ -1979,6 +1979,10 @@ fn docker_arguments(
         "--detach".to_owned(),
         "--interactive".to_owned(),
         "--tty".to_owned(),
+        "--env".to_owned(),
+        "TERM".to_owned(),
+        "--env".to_owned(),
+        "COLORTERM".to_owned(),
         "--name".to_owned(),
         format!("gardr-{spec_name}-{run_id}"),
         "--network".to_owned(),
@@ -3389,6 +3393,12 @@ mod tests {
             &["-p".to_owned(), "complete the assigned work".to_owned()],
         )
         .unwrap();
+        assert!(arguments.windows(2).any(|pair| pair == ["--env", "TERM"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--env", "COLORTERM"])
+        );
         assert!(
             arguments
                 .iter()

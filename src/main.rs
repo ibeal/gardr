@@ -331,8 +331,9 @@ const DOCS: &str = r#"# gardr — one-shot sandbox execution
 `run start` selects the current directory by default, `--repo <path>` selects an existing checkout,
 and `--url <git-url>` creates a persistent clone under `<root>/workspaces`. Every source is mounted
 writable at `/repo`. With no `--ask-file` or `--harness-arg`, `run start` attaches the terminal to
-an interactive harness session; use Docker's default Ctrl-P, Ctrl-Q sequence to detach without
-stopping it. Supplying either kind of autonomous input leaves the run detached and prints its JSON
+an interactive harness session and forwards `TERM` and `COLORTERM`; use Docker's default Ctrl-P,
+Ctrl-Q sequence to detach without stopping it. Supplying either kind of autonomous input leaves the
+run detached and prints its JSON
 record. `--ask-file <path>` copies an autonomous ask into the immutable run record.
 
 A named `--thread` binds a source to `<root>/threads/<name>/CONTINUITY.md`. Later fresh runs reuse
