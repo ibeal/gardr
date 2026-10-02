@@ -238,8 +238,12 @@ fn attach_interactive(record: &gardr::RunRecord) -> Result<(), String> {
         .container
         .as_deref()
         .ok_or_else(|| "interactive attach requires a container identifier".to_owned())?;
-    let status = Command::new("docker")
-        .args(["attach", container])
+    let mut command = Command::new("docker");
+    command.args(["attach", container]);
+    if let Some((key, value)) = herdr_agent_hint(env::var_os("HERDR_ENV")) {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("failed to spawn docker attach: {error}"))?;
     if status.success() {
@@ -252,6 +256,20 @@ fn attach_interactive(record: &gardr::RunRecord) -> Result<(), String> {
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned())
         ))
+    }
+}
+
+/// Returns the `HERDR_AGENT` environment variable to set on the host-visible `docker attach`
+/// child when Gardr itself is running under Herdr, so Herdr can register the interactive
+/// sandbox as a Pi agent. Gardr never mutates its own process environment and never forwards
+/// Herdr variables into the container; only this one variable is added to the detached
+/// `docker attach` child, and only when `HERDR_ENV=1` is present on Gardr's own environment.
+/// Autonomous runs never call this, so they remain undetected by Herdr.
+fn herdr_agent_hint(herdr_env: Option<OsString>) -> Option<(&'static str, &'static str)> {
+    if herdr_env.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        Some(("HERDR_AGENT", "pi"))
+    } else {
+        None
     }
 }
 
@@ -460,6 +478,17 @@ mod tests {
             ..request
         };
         assert!(!is_interactive(&request_with_file, &[]));
+    }
+
+    #[test]
+    fn herdr_agent_hint_is_set_only_when_gardr_runs_under_herdr() {
+        assert_eq!(
+            herdr_agent_hint(Some(OsString::from("1"))),
+            Some(("HERDR_AGENT", "pi"))
+        );
+        assert_eq!(herdr_agent_hint(None), None);
+        assert_eq!(herdr_agent_hint(Some(OsString::from("0"))), None);
+        assert_eq!(herdr_agent_hint(Some(OsString::from(""))), None);
     }
 
     #[test]
