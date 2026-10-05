@@ -157,6 +157,10 @@ impl Store {
         ))
     }
 
+    pub fn rebuild_image(&self, name: &str) -> Result<(String, crate::SpecIdentity)> {
+        crate::rebuild_image_profile(self, name)
+    }
+
     pub fn list_images(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
         if !self.images_path().exists() {

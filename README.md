@@ -100,6 +100,8 @@ gardr image add <name> --file <profile.toml>
 gardr image list
 gardr image show <name>
 gardr image validate <name>
+gardr image rebuild <name>   # no-cache rebuild or re-pull
+gardr image rebuild --all
 
 gardr run start [--repo <path> | --url <git-url>] [--thread <name>] [--ask-file <path>] \
   [--image <name>] [--harness pi] [--model <provider/model>] [--network none]

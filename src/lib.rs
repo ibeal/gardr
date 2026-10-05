@@ -33,7 +33,7 @@ pub(crate) use config::resolve::{
 };
 pub(crate) use credentials::remove_credentials_env;
 pub(crate) use docker::arguments::docker_arguments;
-pub(crate) use docker::image::ensure_image;
+pub(crate) use docker::image::{ensure_image, rebuild_image_profile};
 pub(crate) use docker::{capture_container_logs, capture_run_logs, docker_status};
 pub(crate) use filesystem::{
     approved_child, atomic_write, create_private_dir_all, digest, digest_directory, now,

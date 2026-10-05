@@ -35,6 +35,41 @@ pub(super) fn image(store: &Store, mut args: Vec<String>) -> Result<(), String> 
             }
             print_json(&identity)
         }
+        "rebuild" => {
+            let all = flag(&mut args, "--all");
+            let names = if all {
+                reject_extra(&args)?;
+                store.list_images()?
+            } else {
+                let name = take(&mut args)?;
+                reject_extra(&args)?;
+                vec![name]
+            };
+            let mut failed = false;
+            let results: Vec<_> = names
+                .iter()
+                .map(|name| match store.rebuild_image(name) {
+                    Ok((image_id, identity)) => serde_json::json!({
+                        "name": name,
+                        "image_id": image_id,
+                        "sha256": identity.sha256,
+                    }),
+                    Err(error) => {
+                        failed = true;
+                        serde_json::json!({"name": name, "error": error})
+                    }
+                })
+                .collect();
+            if all {
+                print_json(&results)?;
+            } else {
+                print_json(&results[0])?;
+            }
+            if failed {
+                return Err("image rebuild failed".to_owned());
+            }
+            Ok(())
+        }
         _ => Err(usage()),
     }
 }
